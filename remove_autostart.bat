@@ -3,7 +3,7 @@ setlocal
 title Nanofiber Studio - Windows Auto-Start Removal
 
 echo ========================================================
-echo   Nanofiber Studio - 自動起動の解除
+echo   Nanofiber Studio - Auto-Start Removal
 echo ========================================================
 echo.
 
@@ -12,10 +12,9 @@ set "TARGET_VBS=%STARTUP_DIR%\NanofiberStudio_Launcher.vbs"
 
 if exist "%TARGET_VBS%" (
     del /f /q "%TARGET_VBS%"
-    echo [OK] スタートアップ登録を解除しました。
-    echo      次回PC起動時からは自動起動されません。
+    echo [OK] Auto-start registration removed successfully.
 ) else (
-    echo [INFO] 自動起動は登録されていませんでした。
+    echo [INFO] Auto-start was not registered.
 )
 echo.
 pause

@@ -11,7 +11,7 @@ echo.
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo [WARNING] Administrator rights are required.
-    echo Please right-click this file and select "Run as administrator" (管理者として実行).
+    echo Please right-click this file and select "Run as administrator".
     echo.
     pause
     exit /b 1
