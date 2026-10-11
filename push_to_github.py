@@ -4,17 +4,18 @@ import subprocess
 import shutil
 import webbrowser
 
-# Windows コンソールでの UTF-8 出力エンコーディング保証
+# Windows コンソールでの文字エンコーディング設定
 if sys.platform == "win32":
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
+        # UTF-8 出力を設定（非対応文字は置換）
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
 def print_banner():
     print("=" * 66)
-    print("  Nanofiber Studio 🔬 GitHub アップロードツール (Streamlit Cloud準備)")
+    print("  Nanofiber Studio - GitHub アップロードツール (Streamlit Cloud準備)")
     print("=" * 66)
     print()
 
@@ -28,30 +29,29 @@ def main():
     # 2. Git のインストール確認
     git_bin = shutil.which("git")
     if not git_bin:
-        print("❌ [エラー] Git がシステムに見つかりません。")
+        print("[エラー] Git がシステムに見つかりません。")
         print("   https://git-scm.com/downloads から Git をインストールしてください。")
         input("\nEnter キーを押して終了します...")
         return 1
 
     # 3. Git リポジトリ状態の確認とコミット
     if not os.path.exists(os.path.join(app_dir, ".git")):
-        print("📦 Git リポジトリを初期化しています...")
+        print("[準備] Git リポジトリを初期化しています...")
         subprocess.run(["git", "init"], check=True)
         subprocess.run(["git", "branch", "-M", "main"], check=True)
 
     # 未コミットの変更があれば自動でコミット
     status_proc = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, encoding="utf-8", errors="ignore")
     if status_proc.stdout.strip():
-        print("📝 最新の変更をローカルコミットしています...")
+        print("[更新] 最新の変更をローカルコミットしています...")
         subprocess.run(["git", "add", "."], check=True)
-        # ユーザー設定がない場合のフォールバック
         config_name = subprocess.run(["git", "config", "user.name"], capture_output=True, text=True).stdout.strip()
         if not config_name:
             subprocess.run(["git", "config", "user.name", "ryugo"], check=True)
             subprocess.run(["git", "config", "user.email", "ryugo@users.noreply.github.com"], check=True)
         subprocess.run(["git", "commit", "-m", "Update project for Streamlit Cloud"], check=True)
 
-    print("✅ ローカルプロジェクトの準備が完了しています。\n")
+    print("[OK] ローカルプロジェクトの準備が完了しています。\n")
 
     # 4. ステップ 1: GitHub リポジトリ作成の案内
     print("------------------------------------------------------------------")
@@ -62,9 +62,9 @@ def main():
     print("・注意: 「Add a README file」等のチェックは外したままで作成してください")
     print()
 
-    open_browser = input("👉 ブラウザで GitHub 新規作成ページを開きますか？ [Y/n]: ").strip().lower()
+    open_browser = input(">> ブラウザで GitHub 新規作成ページを開きますか？ [Y/n]: ").strip().lower()
     if open_browser in ("", "y", "yes"):
-        print("🌐 ブラウザを開いています: https://github.com/new")
+        print("[Web] ブラウザを開いています: https://github.com/new")
         webbrowser.open("https://github.com/new")
         print()
 
@@ -78,13 +78,13 @@ def main():
 
     repo_url = input("GitHub URL: ").strip().strip('"').strip("'")
     if not repo_url:
-        print("\n⚠️ URLが入力されませんでした。処理を中断します。")
+        print("\n[注意] URLが入力されませんでした。処理を中断します。")
         input("\nEnter キーを押して終了します...")
         return 0
 
     # 簡易URLバリデーション
     if not (repo_url.startswith("https://") or repo_url.startswith("git@")):
-        print(f"\n⚠️ 入力されたURLの形式が正しくない可能性があります: {repo_url}")
+        print(f"\n[注意] 入力されたURLの形式が正しくない可能性があります: {repo_url}")
         proceed = input("このまま続行しますか？ [y/N]: ").strip().lower()
         if proceed not in ("y", "yes"):
             print("\n処理を中断しました。")
@@ -100,20 +100,20 @@ def main():
     subprocess.run(["git", "remote", "remove", "origin"], capture_output=True)
     add_remote_res = subprocess.run(["git", "remote", "add", "origin", repo_url], capture_output=True, text=True)
     if add_remote_res.returncode != 0:
-        print(f"❌ リモートの追加に失敗しました: {add_remote_res.stderr}")
+        print(f"[エラー] リモートの追加に失敗しました: {add_remote_res.stderr}")
         input("\nEnter キーを押して終了します...")
         return 1
 
     subprocess.run(["git", "branch", "-M", "main"], check=True)
 
     # git push の実行
-    print("🚀 git push -u origin main を実行しています...\n")
+    print("[送信] git push -u origin main を実行しています...\n")
     push_res = subprocess.run(["git", "push", "-u", "origin", "main"])
 
     print()
     if push_res.returncode == 0:
         print("==================================================================")
-        print("  🎉 [大成功] GitHub へのプロジェクト送信が完了しました！")
+        print("  【大成功】 GitHub へのプロジェクト送信が完了しました！")
         print("==================================================================")
         print()
         print("続けて以下の手順で Streamlit Cloud にデプロイしてください：")
@@ -122,16 +122,16 @@ def main():
         print("3. Repository: 先ほど作成したリポジトリを選択")
         print("4. Main file path: app.py を確認")
         print("5. 「Deploy!」をクリック")
-        print("   → 数分で世界中（iPhoneの4G/5G・外出先Wi-Fi）からアクセスできるURLが発行されます！")
+        print("   -> 数分で世界中（iPhoneの4G/5G・外出先Wi-Fi）からアクセスできるURLが発行されます！")
         print()
 
-        open_streamlit = input("👉 今すぐブラウザで Streamlit Cloud を開きますか？ [Y/n]: ").strip().lower()
+        open_streamlit = input(">> 今すぐブラウザで Streamlit Cloud を開きますか？ [Y/n]: ").strip().lower()
         if open_streamlit in ("", "y", "yes"):
-            print("🌐 ブラウザを開いています: https://share.streamlit.io")
+            print("[Web] ブラウザを開いています: https://share.streamlit.io")
             webbrowser.open("https://share.streamlit.io")
     else:
         print("==================================================================")
-        print("  ❌ [送信失敗] GitHub へのプッシュ中にエラーが発生しました")
+        print("  【送信失敗】 GitHub へのプッシュ中にエラーが発生しました")
         print("==================================================================")
         print()
         print("【よくある原因と対処法】")
