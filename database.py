@@ -59,6 +59,14 @@ def init_db(db_path: str = DB_PATH):
             cursor.execute("ALTER TABLE fabrication_records ADD COLUMN recipe_name TEXT")
         except Exception:
             pass
+        try:
+            cursor.execute("ALTER TABLE fabrication_records ADD COLUMN fabrication_date TEXT")
+        except Exception:
+            pass
+        try:
+            cursor.execute("ALTER TABLE fabrication_records ADD COLUMN temperature TEXT")
+        except Exception:
+            pass
         conn.commit()
 
 def get_db_bytes() -> bytes:
@@ -104,6 +112,8 @@ def save_record(
     total_distance_mm: Optional[float] = None,
     is_broken: int = 0,
     recipe_name: Optional[str] = "",
+    fabrication_date: Optional[str] = "",
+    temperature: Optional[str] = "",
     db_path: str = DB_PATH
 ) -> int:
     """作製レコードを保存"""
@@ -122,17 +132,21 @@ def save_record(
     safe_dist = clean_for_json(total_distance_mm)
     safe_broken = int(is_broken) if is_broken else 0
     safe_recipe = str(recipe_name or "").strip()
+    safe_date = str(fabrication_date or created_at.split(" ")[0]).strip()
+    safe_temp = str(temperature or "").strip()
 
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO fabrication_records (
                 sample_id, created_at, photo_path, params_json, csv_path, csv_data_json,
-                initial_val, final_pct, min_pct, notes, sem_photo_path, total_distance_mm, is_broken, recipe_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                initial_val, final_pct, min_pct, notes, sem_photo_path, total_distance_mm, is_broken,
+                recipe_name, fabrication_date, temperature
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             sample_id, created_at, photo_path, params_json, csv_path, csv_data_json,
-            safe_init_val, safe_final_pct, safe_min_pct, notes, sem_photo_path, safe_dist, safe_broken, safe_recipe
+            safe_init_val, safe_final_pct, safe_min_pct, notes, sem_photo_path, safe_dist, safe_broken,
+            safe_recipe, safe_date, safe_temp
         ))
         record_id = cursor.lastrowid
         conn.commit()
@@ -161,11 +175,15 @@ def get_all_records(include_csv_data: bool = False, db_path: str = DB_PATH) -> L
             except Exception:
                 c_data = None
 
+        created_ts = row_dict.get("created_at") or ""
+        fab_date = row_dict.get("fabrication_date") or (created_ts.split(" ")[0] if created_ts else "")
         records.append({
             "id": row_dict.get("id"),
             "sample_id": row_dict.get("sample_id"),
             "recipe_name": row_dict.get("recipe_name") or "",
-            "created_at": row_dict.get("created_at"),
+            "fabrication_date": fab_date,
+            "temperature": row_dict.get("temperature") or "",
+            "created_at": created_ts,
             "photo_path": row_dict.get("photo_path"),
             "params": p_data,
             "csv_path": row_dict.get("csv_path"),
@@ -203,11 +221,15 @@ def get_record_by_id(record_id: int, db_path: str = DB_PATH) -> Optional[Dict[st
     except Exception:
         c_data = None
 
+    created_ts = row_dict.get("created_at") or ""
+    fab_date = row_dict.get("fabrication_date") or (created_ts.split(" ")[0] if created_ts else "")
     return {
         "id": row_dict.get("id"),
         "sample_id": row_dict.get("sample_id"),
         "recipe_name": row_dict.get("recipe_name") or "",
-        "created_at": row_dict.get("created_at"),
+        "fabrication_date": fab_date,
+        "temperature": row_dict.get("temperature") or "",
+        "created_at": created_ts,
         "photo_path": row_dict.get("photo_path"),
         "params": p_data,
         "csv_path": row_dict.get("csv_path"),
@@ -265,6 +287,8 @@ def update_record(
     final_pct: Optional[float] = None,
     min_pct: Optional[float] = None,
     recipe_name: Optional[str] = "",
+    fabrication_date: Optional[str] = "",
+    temperature: Optional[str] = "",
     db_path: str = DB_PATH
 ) -> bool:
     """既存レコードの全データを更新"""
@@ -281,6 +305,8 @@ def update_record(
     safe_dist = clean_for_json(total_distance_mm)
     safe_broken = int(is_broken) if is_broken else 0
     safe_recipe = str(recipe_name or "").strip()
+    safe_date = str(fabrication_date or "").strip()
+    safe_temp = str(temperature or "").strip()
 
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
@@ -297,12 +323,15 @@ def update_record(
                 initial_val = ?,
                 final_pct = ?,
                 min_pct = ?,
-                recipe_name = ?
+                recipe_name = ?,
+                fabrication_date = ?,
+                temperature = ?
             WHERE id = ?
         """, (
             sample_id, params_json, notes, safe_broken, safe_dist,
             sem_photo_path, csv_path, csv_data_json,
-            safe_init_val, safe_final_pct, safe_min_pct, safe_recipe, record_id
+            safe_init_val, safe_final_pct, safe_min_pct, safe_recipe,
+            safe_date, safe_temp, record_id
         ))
         updated = cursor.rowcount > 0
         conn.commit()
@@ -318,6 +347,62 @@ def safe_num(v, default=0.0):
         return default if math.isnan(val) or math.isinf(val) else val
     except (ValueError, TypeError):
         return default
+
+def get_record_metrics(rec: dict) -> dict:
+    """作製データ履歴に必要な4大指標（温度、総加熱時間、延伸距離、延伸速度）を安全に算出"""
+    if not rec:
+        return {
+            "temperature_str": "-",
+            "total_time_s": 0.0,
+            "total_time_str": "0s",
+            "distance_mm": 0.0,
+            "distance_str": "0.0mm",
+            "speed_ums": 0.0,
+            "speed_str": "0µm/s"
+        }
+    params = rec.get("params") or []
+    # 1. 温度
+    temp_val = str(rec.get("temperature") or "").strip()
+    if not temp_val:
+        currents = [safe_num(p.get("current_A")) for p in params if isinstance(p, dict) and safe_num(p.get("current_A")) > 0]
+        if currents:
+            temp_val = f"{currents[0]:.3f}A"
+        else:
+            temp_val = "-"
+    elif not temp_val.endswith("℃") and not temp_val.endswith("°C") and temp_val.replace(".", "", 1).isdigit():
+        temp_val = f"{temp_val}℃"
+
+    # 2. 総加熱時間
+    stop_times = [safe_num(p.get("stop_time_s"), 0.0) for p in params if isinstance(p, dict)]
+    total_time = max(stop_times) if stop_times else 0.0
+
+    # 3. 延伸距離
+    dist_mm = rec.get("total_distance_mm")
+    if dist_mm is None:
+        tot_um = 0.0
+        for p in params:
+            if isinstance(p, dict):
+                spd = safe_num(p.get("speed_ums"), 0.0)
+                t_start = safe_num(p.get("start_time_s"), 0.0)
+                t_stop = safe_num(p.get("stop_time_s"), 0.0)
+                tot_um += spd * max(0.0, t_stop - t_start)
+        dist_mm = tot_um / 1000.0
+    else:
+        dist_mm = safe_num(dist_mm, 0.0)
+
+    # 4. 延伸速度
+    speeds = [safe_num(p.get("speed_ums"), 0.0) for p in params if isinstance(p, dict)]
+    max_spd = max(speeds) if speeds else 0.0
+
+    return {
+        "temperature_str": temp_val,
+        "total_time_s": total_time,
+        "total_time_str": f"{total_time:.0f}s",
+        "distance_mm": round(dist_mm, 2),
+        "distance_str": f"{dist_mm:.1f}mm",
+        "speed_ums": max_spd,
+        "speed_str": f"{max_spd:.0f}µm/s"
+    }
 
 def compute_param_signature(params: list) -> str:
     """作製ステップのパラメータ群から一意の条件シグネチャを生成（微小な誤差を吸収）"""

@@ -7,6 +7,7 @@ import json
 from datetime import datetime
 from typing import Optional
 from PIL import Image
+import copy
 
 try:
     import pillow_heif
@@ -195,6 +196,11 @@ def calculate_stretch_summary(params: list) -> dict:
         "steps": steps_detailed
     }
 
+def get_max_stop_time(params: list) -> float:
+    """各ステップの終了時刻の最大値（総加熱時間）を安全に取得（欠損値やNoneによるTypeErrorを完全に防止）"""
+    vals = [safe_num(p.get("stop_time_s"), 0.0) for p in (params or []) if isinstance(p, dict)]
+    return max(vals) if vals else 0.0
+
 def adjust_steps_count(steps: list, target_count: int) -> list:
     """ステップ数を target_count に増減調整する（追加時は直前の時間を引き継ぐ）"""
     if target_count < 1:
@@ -258,17 +264,16 @@ def clean_and_normalize_params(params: list) -> list:
 
         cleaned.append({
             "step": idx + 1,
-            "current_A": curr,
-            "speed_ums": spd,
-            "start_time_s": t_start,
-            "stop_time_s": t_stop
+            "current_A": round(curr, 3),
+            "speed_ums": round(spd, 1),
+            "start_time_s": round(t_start, 1),
+            "stop_time_s": round(t_stop, 1)
         })
     return cleaned
 
 # ページ基本設定（ワイドモード＆フルスクリーン活用）
 st.set_page_config(
-    page_title="Nanofiber Studio 🔬 ナノ光ファイバ作製管理システム",
-    page_icon="🔬",
+    page_title="Nanofiber Studio - ナノ光ファイバ作製管理システム",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -765,6 +770,39 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Sキー / Ctrl+S による保存ショートカットの登録
+import streamlit.components.v1 as components
+components.html("""
+<script>
+(function() {
+    const doc = window.parent.document;
+    function handleKeyDown(e) {
+        const active = doc.activeElement;
+        const tag = active ? (active.tagName || '').toLowerCase() : '';
+        const isInput = tag === 'input' || tag === 'textarea' || (active && active.isContentEditable);
+
+        const isCtrlS = (e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S');
+        const isSingleS = !isInput && (e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey && !e.altKey;
+
+        if (isCtrlS || isSingleS) {
+            if (isCtrlS) {
+                e.preventDefault();
+            }
+            const buttons = Array.from(doc.querySelectorAll('button'));
+            const saveBtn = buttons.find(b => b.innerText && b.innerText.includes('保存'));
+            if (saveBtn) {
+                saveBtn.click();
+            }
+        }
+    }
+    if (!window.parent.__nanofiberSaveAttached) {
+        doc.addEventListener('keydown', handleKeyDown, true);
+        window.parent.__nanofiberSaveAttached = true;
+    }
+})();
+</script>
+""", height=0, width=0)
+
 # セッション状態の初期化
 if "watch_dir" not in st.session_state:
     st.session_state["watch_dir"] = watcher.DEFAULT_WATCH_DIR
@@ -775,10 +813,16 @@ if "sample_id" not in st.session_state:
     st.session_state["sample_id"] = f"NF-{datetime.now().strftime('%Y%m%d-%H%M')}"
 if "recipe_name" not in st.session_state:
     st.session_state["recipe_name"] = ""
+if "fabrication_date" not in st.session_state:
+    st.session_state["fabrication_date"] = datetime.now().date()
+if "temperature" not in st.session_state:
+    st.session_state["temperature"] = ""
 if "notes" not in st.session_state:
     st.session_state["notes"] = "標準作製条件"
 if "is_broken" not in st.session_state:
     st.session_state["is_broken"] = 0
+if "editor_refresh_id" not in st.session_state:
+    st.session_state["editor_refresh_id"] = 0
 
 if "extracted_params" not in st.session_state:
     st.session_state["extracted_params"] = [
@@ -814,7 +858,6 @@ with st.sidebar:
     # 1. ブランドヘッダー
     st.markdown("""
     <div class="sidebar-brand">
-        <div class="sidebar-brand-icon">🔬</div>
         <div>
             <div class="sidebar-brand-title">Nanofiber Studio</div>
             <div class="sidebar-brand-sub">光ファイバ作製データ管理</div>
@@ -822,11 +865,13 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    # 2. メインアクション: 「＋ 新規サンプルの登録」ボタン
-    if st.button("＋ 新規サンプルの登録", type="primary", use_container_width=True):
+    # 2. メインアクション: 「新規サンプルの登録」ボタン
+    if st.button("新規サンプルの登録", type="primary", use_container_width=True):
         st.session_state["selected_record_id"] = "NEW"
         st.session_state["sample_id"] = f"NF-{datetime.now().strftime('%Y%m%d-%H%M')}"
         st.session_state["recipe_name"] = ""
+        st.session_state["temperature"] = ""
+        st.session_state["fabrication_date"] = datetime.now().date()
         st.session_state["notes"] = "標準作製条件"
         st.session_state["is_broken"] = 0
         st.session_state["sem_image_bytes"] = None
@@ -834,6 +879,7 @@ with st.sidebar:
         st.session_state["csv_df"] = None
         st.session_state["csv_stats"] = {}
         st.session_state["csv_file_name"] = None
+        st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
         if "cached_csv_bytes" in st.session_state:
             del st.session_state["cached_csv_bytes"]
         st.rerun()
@@ -862,35 +908,35 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     # 4. ナビゲーションボタン（横幅十分で省略されない配置）
-    if st.button("🕘 最新サンプルを表示", type="secondary", use_container_width=True):
+    if st.button("最新サンプルを表示", type="secondary", use_container_width=True):
         if all_records:
             st.session_state["selected_record_id"] = all_records[0]["id"]
         st.rerun()
 
     side_c1, side_c2 = st.columns(2)
     with side_c1:
-        if st.button("📊 サンプル比較", type="secondary", use_container_width=True):
+        if st.button("サンプル比較", type="secondary", use_container_width=True):
             st.session_state["selected_record_id"] = "COMPARE"
             st.rerun()
     with side_c2:
-        if st.button("🎯 歩留まり集計", type="secondary", use_container_width=True):
+        if st.button("同一条件の歩留まり集計", type="secondary", use_container_width=True):
             st.session_state["selected_record_id"] = "YIELD_ANALYSIS"
             st.rerun()
 
-    # 📱 iPhone / スマホ連携 (QRコード & リモート起動)
-    with st.expander("📱 iPhone・スマホ接続 ＆ リモート起動", expanded=False):
+    # iPhone / スマホ連携 (QRコード & リモート起動)
+    with st.expander("iPhone・スマホ接続 ＆ リモート起動", expanded=False):
         net_ip = get_network_ip()
         mobile_url = f"http://{net_ip}:8501"
         launcher_url = f"http://{net_ip}:8500"
 
         conn_choice = st.radio(
             "接続種別",
-            options=["🔬 アプリ (:8501)", "⚡ 起動ポータル (:8500)"],
+            options=["アプリ (:8501)", "起動ポータル (:8500)"],
             horizontal=True,
             label_visibility="collapsed",
             key="sidebar_iphone_view_mode"
         )
-        if conn_choice == "🔬 アプリ (:8501)":
+        if conn_choice == "アプリ (:8501)":
             st.markdown(f"""
             <div style="background:#141d2a; border:1px solid #233b5d; border-radius:8px; padding:8px 10px; margin-bottom:8px; text-align:center;">
                 <div style="font-size:0.73rem; color:#94a3b8; font-weight:600;">iPhoneアクセス用URL</div>
@@ -899,7 +945,7 @@ with st.sidebar:
             """, unsafe_allow_html=True)
             qr_bytes = generate_qr_code_image_bytes(mobile_url)
             if qr_bytes:
-                st.image(qr_bytes, caption="📷 アプリ用 QRコード", use_container_width=True)
+                st.image(qr_bytes, caption="アプリ用 QRコード", use_container_width=True)
             st.markdown("""
             <div style="font-size:0.76rem; color:#94a3b8; line-height:1.4;">
                 iPhoneの標準カメラでかざしてSafariで開きます。<br>
@@ -915,10 +961,10 @@ with st.sidebar:
             """, unsafe_allow_html=True)
             qr_launch = generate_qr_code_image_bytes(launcher_url)
             if qr_launch:
-                st.image(qr_launch, caption="⚡ 起動ポータル QRコード", use_container_width=True)
+                st.image(qr_launch, caption="起動ポータル QRコード", use_container_width=True)
             st.markdown("""
             <div style="font-size:0.76rem; color:#cbd5e1; line-height:1.45;">
-                💡 <b>iPhoneからサーバーを立ち上げる方法:</b><br>
+                iPhoneからサーバーを立ち上げる方法:<br>
                 1. このURLをSafariで開く<br>
                 2. 画面下の共有ボタンから<b>「ホーム画面に追加」</b><br>
                 3. アプリが停止していても、ホーム画面から1タップでPC側サーバーを立ち上げられます。
@@ -929,8 +975,8 @@ with st.sidebar:
 
     # 5. 実用性向上: サンプル検索ボックス
     search_q = st.text_input(
-        "🔍 サンプル検索",
-        placeholder="🔍 サンプル名・メモで検索...",
+        "サンプル検索",
+        placeholder="サンプル名・メモで検索...",
         label_visibility="collapsed",
         key="search_input_box"
     )
@@ -938,16 +984,16 @@ with st.sidebar:
     # 6. ステータス別絞り込みタブ
     filter_choice = st.segmented_control(
         "ステータス別絞り込み",
-        options=["すべて", "🟢 未破断", "🔴 破断"],
+        options=["すべて", "未破断", "破断"],
         default="すべて",
-        format_func=lambda x: f"すべて ({total_cnt})" if x == "すべて" else (f"🟢 未破断 ({intact_cnt})" if "未破断" in x else f"🔴 破断 ({broken_cnt})"),
+        format_func=lambda x: f"すべて ({total_cnt})" if x == "すべて" else (f"未破断 ({intact_cnt})" if "未破断" in x else f"破断 ({broken_cnt})"),
         label_visibility="collapsed"
     )
 
     # フィルタ適用
-    if filter_choice == "🟢 未破断":
+    if filter_choice == "未破断":
         filtered_records = [r for r in all_records if not r.get("is_broken")]
-    elif filter_choice == "🔴 破断":
+    elif filter_choice == "破断":
         filtered_records = [r for r in all_records if r.get("is_broken")]
     else:
         filtered_records = all_records
@@ -975,35 +1021,20 @@ with st.sidebar:
 
         def format_item(rid):
             if rid == "NEW":
-                return "✨ 新規サンプルの登録中"
+                return "[新規登録中] 新規サンプルの登録"
             r = rec_map.get(rid)
             if not r:
                 return f"ID: {rid}"
             s_id = r.get("sample_id", "NF")
             is_b = r.get("is_broken", 0)
-            status_dot = "🔴" if is_b else "🟢"
-            
-            dist = r.get("total_distance_mm")
-            dist_str = f"{dist:.1f}mm" if dist is not None else ""
-            
+            status_tag = "[破断]" if is_b else "[正常]"
+
+            metrics = db.get_record_metrics(r)
             pct = r.get("final_pct")
-            pct_str = f"{pct:.0f}%" if pct is not None else ""
-            
-            has_sem = "🔬" if r.get("sem_photo_path") else ""
-            t_ago = format_time_ago(r.get("created_at", ""))
-            
-            meta = []
-            if dist_str:
-                meta.append(dist_str)
-            if pct_str:
-                meta.append(pct_str)
-            if has_sem:
-                meta.append(has_sem)
-            if t_ago:
-                meta.append(t_ago)
-                
-            meta_txt = " · ".join(meta)
-            return f"{status_dot} {s_id}  [{meta_txt}]"
+            pct_str = f" | 透過率: {pct:.0f}%" if pct is not None else ""
+
+            meta_txt = f"温度: {metrics['temperature_str']} | 加熱時間: {metrics['total_time_str']} | 延伸距離: {metrics['distance_str']} | 延伸速度: {metrics['speed_str']}{pct_str}"
+            return f"{status_tag} {s_id}  [{meta_txt}]"
 
         cur_sel = st.session_state.get("selected_record_id", "NEW")
         sel_idx = options.index(cur_sel) if cur_sel in options else 0
@@ -1023,15 +1054,15 @@ with st.sidebar:
             label_visibility="collapsed"
         )
 
-    # 7. サイドバー最下部: ⚙️ 設定 (Settings)
+    # 7. サイドバー最下部: 設定 (Settings)
     st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
-    with st.expander("⚙️ 設定 (Settings)", expanded=False):
-        st.caption("📁 作製条件写真フォルダ")
+    with st.expander("設定 (Settings)", expanded=False):
+        st.caption("作製条件写真フォルダ")
         dir_status = watcher.check_watch_dir_status(st.session_state["watch_dir"])
         if dir_status["exists"]:
-            st.caption(f"🟢 Google ドライブ接続中: {dir_status['image_count']} 枚")
+            st.caption(f"[接続中] Google ドライブフォルダ: {dir_status['image_count']} 枚")
         else:
-            st.caption("🔴 フォルダ未接続")
+            st.caption("[未接続] フォルダが見つかりません")
         watch_dir_input = st.text_input("フォルダパス", value=st.session_state["watch_dir"], label_visibility="collapsed")
         cleaned_dir = safe_clean_path(watch_dir_input)
         if cleaned_dir != st.session_state["watch_dir"]:
@@ -1039,43 +1070,43 @@ with st.sidebar:
             st.rerun()
 
         st.markdown("---")
-        st.caption("🔑 Gemini API キー")
+        st.caption("Gemini API キー")
         api_key_input = st.text_input("APIキー", value=st.session_state["api_key"], type="password", label_visibility="collapsed", placeholder="AIzaSy...")
         if api_key_input != st.session_state["api_key"]:
             st.session_state["api_key"] = api_key_input
             os.environ["GEMINI_API_KEY"] = api_key_input
 
         if st.session_state["api_key"]:
-            if st.button("💾 APIキーを保存", use_container_width=True):
+            if st.button("APIキーを保存", use_container_width=True):
                 if save_env_key(st.session_state["api_key"]):
-                    st.toast("✅ APIキーを保存しました！", icon="🔑")
+                    st.toast("APIキーを保存しました")
 
         st.markdown("---")
-        st.caption("📦 データのバックアップ ＆ クラウド同期")
+        st.caption("データのバックアップ ＆ クラウド同期")
         db_raw_bytes = db.get_db_bytes()
         st.download_button(
-            "💾 データベース保存 (.db)",
+            "データベース保存 (.db)",
             data=db_raw_bytes,
             file_name=f"nanofiber_backup_{datetime.now().strftime('%Y%m%d')}.db",
             mime="application/x-sqlite3",
             use_container_width=True
         )
         restore_file = st.file_uploader(
-            "📥 バックアップから復元",
+            "バックアップから復元",
             type=["db"],
             key="db_restore_uploader",
             help="過去にダウンロードした .db ファイルを選択するとデータを一括復元できます"
         )
         if restore_file is not None:
-            if st.button("⚠️ このデータで復元する", type="secondary", use_container_width=True):
+            if st.button("このデータで復元する", type="secondary", use_container_width=True):
                 if db.restore_db_from_bytes(restore_file.getvalue()):
-                    st.success("✅ データベースを復元しました！")
+                    st.success("データベースを復元しました")
                     st.rerun()
                 else:
-                    st.error("❌ データベースの復元に失敗しました。ファイル形式を確認してください。")
+                    st.error("データベースの復元に失敗しました。ファイル形式を確認してください。")
 
         st.markdown("---")
-        st.caption("🖥️ デスクトップの「ナノ光ファイバ管理」ショートカットからワンクリック起動可能。")
+        st.caption("デスクトップの「ナノ光ファイバ管理」ショートカットから起動可能。")
 
 
 # =========================================================
@@ -1083,16 +1114,16 @@ with st.sidebar:
 # =========================================================
 
 # ---------------------------------------------------------
-# パターン C: 📊 複数サンプルの比較画面
+# パターン C: 複数サンプルの比較画面
 # ---------------------------------------------------------
 if st.session_state["selected_record_id"] == "COMPARE":
     col_back, col_title = st.columns([1.2, 5])
     with col_back:
-        if st.button("⬅️ 新規・詳細に戻る", use_container_width=True):
+        if st.button("新規・詳細に戻る", use_container_width=True):
             st.session_state["selected_record_id"] = "NEW"
             st.rerun()
     with col_title:
-        st.markdown("<h2 style='margin:0;font-weight:800;color:#f8fafc;'>📊 複数サンプルの規格化透過率・作製条件比較</h2>", unsafe_allow_html=True)
+        st.markdown("<h2 style='margin:0;font-weight:800;color:#f8fafc;'>複数サンプルの規格化透過率・作製条件比較</h2>", unsafe_allow_html=True)
 
     st.write("")
 
@@ -1101,7 +1132,7 @@ if st.session_state["selected_record_id"] == "COMPARE":
         st.info("比較可能な透過率データを持つサンプルがありません。")
     else:
         rec_labels = {
-            r["id"]: f"{'🔴' if r.get('is_broken') else '🟢'} {r['sample_id']} ({r['final_pct']:.1f}%)" if r.get('final_pct') is not None else r['sample_id']
+            r["id"]: f"[{'破断' if r.get('is_broken') else '正常'}] {r['sample_id']} ({r['final_pct']:.1f}%)" if r.get('final_pct') is not None else r['sample_id']
             for r in csv_records
         }
         cur_cmp = st.session_state.get("compare_selection", [])
@@ -1128,36 +1159,39 @@ if st.session_state["selected_record_id"] == "COMPARE":
             st.plotly_chart(fig_cmp, use_container_width=True, config={"displayModeBar": False, "responsive": True, "scrollZoom": False})
 
             # 条件・測定結果の比較一覧
-            st.markdown('<div class="section-header"><span>📋 作製条件・光学測定値の比較一覧</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header"><span>作製条件・光学測定値の比較一覧</span></div>', unsafe_allow_html=True)
             cmp_table_data = []
             for r in cmp_records:
-                r_sum = calculate_stretch_summary(r["params"])
+                m_met = db.get_record_metrics(r)
                 cmp_table_data.append({
-                    "延伸結果": "🔴 延伸中破断" if r.get("is_broken") else "🟢 正常終了",
+                    "結果": "延伸中破断" if r.get("is_broken") else "正常終了",
                     "サンプル識別名": r["sample_id"],
-                    "総延伸量 ΔL (mm)": f"{r_sum['total_mm']:.2f} mm",
-                    "総延伸時間 t (s)": f"{max([p.get('stop_time_s', 0) for p in r['params']]) if r['params'] else 0:.0f} s",
+                    "作製日": r.get("fabrication_date") or r.get("created_at", "")[:10],
+                    "温度": m_met["temperature_str"],
+                    "総加熱時間": m_met["total_time_str"],
+                    "延伸距離": m_met["distance_str"],
+                    "延伸速度": m_met["speed_str"],
                     "ステップ数": len(r["params"]),
                     "初期受光強度 V₀": f"{r['initial_val']:.4f}" if r.get('initial_val') is not None else "-",
                     "最終透過率 T_final": f"{r['final_pct']:.1f}%" if r.get('final_pct') is not None else "-",
                     "最小透過率 T_min": f"{r['min_pct']:.1f}%" if r.get('min_pct') is not None else "-",
-                    "SEM写真": "あり 🔬" if r.get("sem_photo_path") else "なし",
+                    "SEM写真": "あり" if r.get("sem_photo_path") else "なし",
                     "実験備考・所見": r.get("notes", "")
                 })
             st.dataframe(pd.DataFrame(cmp_table_data), use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------
-# パターン D: 🎯 作製条件ごとの歩留まり集計ダッシュボード
+# パターン D: 作製条件ごとの歩留まり集計ダッシュボード
 # ---------------------------------------------------------
 elif st.session_state["selected_record_id"] == "YIELD_ANALYSIS":
     col_back, col_title = st.columns([1.2, 5])
     with col_back:
-        if st.button("⬅️ 新規・詳細に戻る", use_container_width=True):
+        if st.button("新規・詳細に戻る", use_container_width=True):
             st.session_state["selected_record_id"] = "NEW"
             st.rerun()
     with col_title:
-        st.markdown("<h2 style='margin:0;font-weight:800;color:#f8fafc;'>🎯 作製条件別 歩留まり集計 ＆ 実績分析</h2>", unsafe_allow_html=True)
+        st.markdown("<h2 style='margin:0;font-weight:800;color:#f8fafc;'>作製条件別 歩留まり集計 ＆ 実績分析</h2>", unsafe_allow_html=True)
 
     st.write("")
     all_yield_summary = db.get_all_conditions_yield_summary(all_records)
@@ -1181,7 +1215,7 @@ elif st.session_state["selected_record_id"] == "YIELD_ANALYSIS":
             st.markdown(f'<div class="kpi-card kpi-card-amber"><div class="kpi-label">最高歩留まり条件</div><div class="kpi-val" style="font-size:0.95rem; color:#fbbf24; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{best_yield_cond["condition_name"]}</div><div class="kpi-sub">歩留まり: {best_yield_cond["yield_rate"]:.1f}% ({best_yield_cond["total_count"]}件)</div></div>', unsafe_allow_html=True)
 
         st.write("")
-        st.markdown('<div class="section-header"><span>📋 作製条件別・歩留まり集計一覧</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header"><span>作製条件別・歩留まり集計一覧</span></div>', unsafe_allow_html=True)
 
         table_data = []
         for s in all_yield_summary:
@@ -1190,7 +1224,7 @@ elif st.session_state["selected_record_id"] == "YIELD_ANALYSIS":
                 avg_f_str += f" ± {s['std_final_pct']:.1f}%"
             loss_str = f"{s['avg_loss_db']:.2f} dB" if s['avg_loss_db'] is not None else "-"
             dist_str = f"{s['avg_dist_mm']:.2f} mm" if s['avg_dist_mm'] is not None else "-"
-            sample_names = ", ".join([f"{'🔴' if sm['is_broken'] else '🟢'}{sm['sample_id']}" for sm in s["samples"]])
+            sample_names = ", ".join([f"[{'破断' if sm['is_broken'] else '正常'}]{sm['sample_id']}" for sm in s["samples"]])
             table_data.append({
                 "作製条件名 (レシピ)": s["condition_name"],
                 "ステップ数": s["step_count"],
@@ -1211,7 +1245,7 @@ elif st.session_state["selected_record_id"] == "YIELD_ANALYSIS":
         # CSVダウンロード
         csv_bytes = df_summary.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            label="📥 条件別歩留まり集計データ (CSV) をダウンロード",
+            label="条件別歩留まり集計データ (CSV) をダウンロード",
             data=csv_bytes,
             file_name=f"nanofiber_yield_summary_{datetime.now().strftime('%Y%m%d')}.csv",
             mime="text/csv",
@@ -1258,87 +1292,130 @@ elif st.session_state["selected_record_id"] == "YIELD_ANALYSIS":
 
 
 # ---------------------------------------------------------
-# パターン A: 📝 新規作製データの登録画面
+# パターン A: 新規作製データの登録画面
 # ---------------------------------------------------------
 elif st.session_state["selected_record_id"] == "NEW":
-    st.markdown("<h2 style='margin:0 0 12px 0;font-weight:800;color:#f8fafc;'>📝 新規サンプルの作製・登録</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 style='margin:0 0 12px 0;font-weight:800;color:#f8fafc;'>新規サンプルの作製・登録</h2>", unsafe_allow_html=True)
 
     # トップコントロールカード
+    refresh_tag = st.session_state.get("editor_refresh_id", 0)
     with st.container(border=True):
-        top1, top2, top3, top4, top5 = st.columns([1.9, 1.8, 1.6, 2.7, 1.4], gap="medium")
-        with top1:
+        row1_c1, row1_c2, row1_c3 = st.columns([1.6, 1.2, 1.2], gap="medium")
+        with row1_c1:
             st.session_state["sample_id"] = st.text_input(
-                "🏷️ サンプル識別名 (Sample ID)",
-                value=st.session_state["sample_id"]
+                "サンプル識別名 (Sample ID)",
+                value=st.session_state.get("sample_id", f"NF-{datetime.now().strftime('%Y%m%d-%H%M')}"),
+                key=f"new_sample_id_input_{refresh_tag}"
             )
-        with top2:
+        with row1_c2:
+            cur_date_val = st.session_state.get("fabrication_date", datetime.now().date())
+            picked_date = st.date_input(
+                "作製日 (Date)",
+                value=cur_date_val,
+                key=f"fab_date_new_{refresh_tag}"
+            )
+            st.session_state["fabrication_date"] = picked_date
+        with row1_c3:
+            st.session_state["temperature"] = st.text_input(
+                "加熱温度 (°C)",
+                value=st.session_state.get("temperature", ""),
+                placeholder="例: 1250",
+                key=f"temp_new_{refresh_tag}",
+                help="加熱炉温度（°C）または設定温度を入力できます"
+            )
+
+        row2_c1, row2_c2, row2_c3, row2_c4 = st.columns([1.5, 1.3, 2.0, 1.4], gap="medium")
+        with row2_c1:
             st.session_state["recipe_name"] = st.text_input(
-                "📋 作製条件名 (Recipe)",
+                "作製条件名 (Recipe)",
                 value=st.session_state.get("recipe_name", ""),
                 placeholder="例: 標準条件A, 4段延伸",
+                key=f"recipe_new_{refresh_tag}",
                 help="同一の条件名または同一パラメータのサンプル間で歩留まりが自動集計されます"
             )
-        with top3:
+        with row2_c2:
             broken_choice = st.radio(
-                "⚡ 延伸結果 (破断有無)",
-                ["🟢 正常終了（未破断）", "🔴 延伸中破断"],
+                "延伸結果 (破断有無)",
+                ["正常終了（未破断）", "延伸中破断"],
                 horizontal=True,
                 index=1 if st.session_state.get("is_broken", 0) else 0,
                 key="is_broken_selector_new"
             )
-            st.session_state["is_broken"] = 1 if "🔴" in broken_choice else 0
-        with top4:
+            st.session_state["is_broken"] = 1 if "延伸中破断" in broken_choice else 0
+        with row2_c3:
             st.session_state["notes"] = st.text_input(
-                "📝 実験備考・所見",
-                value=st.session_state["notes"],
-                placeholder="加熱炉配置、ファイバ仕様、実験所見など"
+                "実験備考・所見",
+                value=st.session_state.get("notes", "標準作製条件"),
+                placeholder="加熱炉配置、ファイバ仕様、実験所見など",
+                key=f"notes_new_{refresh_tag}"
             )
-        with top5:
+        with row2_c4:
             st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            save_clicked_top = st.button("💾 【 作製データを保存 】", type="primary", use_container_width=True, key="save_btn_top")
+            save_clicked_top = st.button("【 作製データを保存 】 [Sキー]", type="primary", use_container_width=True, key="save_btn_top")
 
-    # 現在の条件の過去歩留まり・実績バナー
+    # 【同じ条件で複数回作成して歩留まりを見る欄】
     cur_cond_stats = db.get_condition_yield_stats(all_records, st.session_state["extracted_params"], st.session_state.get("recipe_name", ""))
     cond_lbl = db.get_condition_label(st.session_state["extracted_params"], st.session_state.get("recipe_name", ""))
     
-    if cur_cond_stats["total_count"] > 0:
-        c_rate = cur_cond_stats["yield_rate"]
-        c_color = "#34d399" if c_rate >= 80 else ("#fbbf24" if c_rate >= 50 else "#f87171")
-        avg_f_str = f"{cur_cond_stats['avg_final_pct']:.1f}%" if cur_cond_stats['avg_final_pct'] is not None else "-"
-        st.markdown(f"""
-        <div class="yield-badge-live">
-            🎯 <b>同一作製条件（{cond_lbl}）の実績・歩留まり</b>: 
-            試行数 <b>{cur_cond_stats['total_count']} 件</b> ｜ 
-            未破断歩留まり: <b style="color:{c_color};">{c_rate:.1f}%</b> (未破断: {cur_cond_stats['intact_count']}件 / 破断: {cur_cond_stats['broken_count']}件) ｜ 
-            平均最終透過率: <b>{avg_f_str}</b>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown(f"""
-        <div class="yield-badge-new">
-            💡 <b>この作製条件（{cond_lbl}）は初回試行（登録数: 0件）です</b>（保存後に同一条件の歩留まりが自動集計されます）
-        </div>
-        """, unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown(f'<div style="font-size:0.92rem;font-weight:700;color:#f1f5f9;margin-bottom:8px;">同一条件での複数回作製実績・歩留まり集計 （条件: <span style="color:#38bdf8;">{cond_lbl}</span>）</div>', unsafe_allow_html=True)
+        if cur_cond_stats["total_count"] > 0:
+            c_rate = cur_cond_stats["yield_rate"]
+            c_color = "#34d399" if c_rate >= 80 else ("#fbbf24" if c_rate >= 50 else "#f87171")
+            avg_f_str = f"{cur_cond_stats['avg_final_pct']:.1f}%" if cur_cond_stats['avg_final_pct'] is not None else "-"
+            avg_l_str = f"{cur_cond_stats['avg_loss_db']:.2f} dB" if cur_cond_stats['avg_loss_db'] is not None else "-"
+
+            y_c1, y_c2, y_c3, y_c4 = st.columns(4)
+            with y_c1:
+                st.markdown(f'<div class="kpi-card kpi-card-blue"><div class="kpi-label">累計試行回数</div><div class="kpi-val" style="color:#38bdf8;">{cur_cond_stats["total_count"]} 件</div><div class="kpi-sub">同条件での全作製数</div></div>', unsafe_allow_html=True)
+            with y_c2:
+                st.markdown(f'<div class="kpi-card kpi-card-green"><div class="kpi-label">未破断歩留まり</div><div class="kpi-val" style="color:{c_color};">{c_rate:.1f}%</div><div class="kpi-sub">正常: {cur_cond_stats["intact_count"]}件 / 破断: {cur_cond_stats["broken_count"]}件</div></div>', unsafe_allow_html=True)
+            with y_c3:
+                st.markdown(f'<div class="kpi-card kpi-card-amber"><div class="kpi-label">平均最終透過率</div><div class="kpi-val" style="color:#fbbf24;">{avg_f_str}</div><div class="kpi-sub">規格化受光強度基準</div></div>', unsafe_allow_html=True)
+            with y_c4:
+                st.markdown(f'<div class="kpi-card kpi-card-purple"><div class="kpi-label">平均光挿入損失</div><div class="kpi-val" style="color:#c084fc;">{avg_l_str}</div><div class="kpi-sub">Insertion Loss</div></div>', unsafe_allow_html=True)
+
+            # 同一条件の過去サンプル一覧
+            matched_same = [r for r in all_records if db.matches_condition(r, st.session_state["extracted_params"], st.session_state.get("recipe_name", ""))]
+            if matched_same:
+                m_list = []
+                for mr in matched_same:
+                    m_met = db.get_record_metrics(mr)
+                    m_list.append({
+                        "サンプル識別名": mr.get("sample_id"),
+                        "作製日": mr.get("fabrication_date") or mr.get("created_at", "")[:10],
+                        "温度": m_met["temperature_str"],
+                        "総加熱時間": m_met["total_time_str"],
+                        "延伸距離": m_met["distance_str"],
+                        "延伸速度": m_met["speed_str"],
+                        "結果": "延伸中破断" if mr.get("is_broken") else "正常終了",
+                        "最終透過率": f"{mr.get('final_pct'):.1f}%" if mr.get('final_pct') is not None else "-",
+                        "備考": mr.get("notes", "")
+                    })
+                with st.expander(f"同一条件サンプルの作製データ履歴（全 {len(m_list)} 件）", expanded=False):
+                    st.dataframe(pd.DataFrame(m_list), use_container_width=True, hide_index=True)
+        else:
+            st.markdown(f'<div class="yield-badge-new">この作製条件（{cond_lbl}）は初回試行（登録数: 0件）です。保存後に同一条件の歩留まりが自動集計されます。</div>', unsafe_allow_html=True)
 
     # 左右2列のフルワイドレイアウト
     c_left, c_right = st.columns([1, 1], gap="large")
 
     # 【左列】条件パラメータ ＆ SEM写真
     with c_left:
-        st.markdown('<div class="section-header"><span>📋 1. 作製条件パラメータ</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header"><span>1. 作製条件パラメータ</span></div>', unsafe_allow_html=True)
 
-        with st.expander("📷 モニタ写真から作製条件を自動抽出 (AI OCR)", expanded=True):
+        with st.expander("モニタ写真から作製条件を自動抽出 (AI OCR)", expanded=False):
             r_c1, r_c2 = st.columns([2, 1])
             with r_c1:
                 src_type = st.radio(
                     "入力ソース選択",
-                    ["📂 Google ドライブから選択", "📤 写真ファイルをアップロード"],
+                    ["Google ドライブから選択", "写真ファイルをアップロード"],
                     horizontal=True,
                     label_visibility="collapsed"
                 )
 
             img_bytes_to_read = None
-            if src_type == "📂 Google ドライブから選択":
+            if src_type == "Google ドライブから選択":
                 g_images = watcher.get_image_files_in_dir(st.session_state["watch_dir"])
                 if g_images:
                     g_opts = {f"{it['filename']} ({it['modified_at']})": it["path"] for it in g_images}
@@ -1352,14 +1429,14 @@ elif st.session_state["selected_record_id"] == "NEW":
                 else:
                     st.caption(f"`{st.session_state['watch_dir']}` に画像がありません。")
 
-            elif src_type == "📤 写真ファイルをアップロード":
+            elif src_type == "写真ファイルをアップロード":
                 up_p = st.file_uploader("写真ファイルを選択", type=["jpg", "jpeg", "png", "bmp", "webp", "heic", "heif"], label_visibility="collapsed")
                 if up_p is not None:
                     img_bytes_to_read = up_p.getvalue()
 
             with r_c2:
                 if img_bytes_to_read:
-                    if st.button("⚡ 写真から条件を自動抽出", type="primary", use_container_width=True):
+                    if st.button("写真から条件を自動抽出", type="primary", use_container_width=True):
                         if not st.session_state["api_key"]:
                             st.error("左側サイドバーの設定で Gemini API キーを設定してください。")
                         else:
@@ -1367,31 +1444,32 @@ elif st.session_state["selected_record_id"] == "NEW":
                                 res = vision.extract_conditions_from_image(img_bytes_to_read, api_key=st.session_state["api_key"])
                                 if res["success"]:
                                     st.session_state["extracted_params"] = res["data"]
-                                    st.session_state["params_version"] += 1
-                                    st.toast(f"✅ {len(res['data'])} ステップの作製条件を抽出しました！", icon="✨")
+                                    st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
+                                    st.toast(f"{len(res['data'])} ステップの作製条件を抽出しました")
                                     st.rerun()
                                 else:
-                                    st.error(f"❌ {res['error']}")
+                                    st.error(f"エラー: {res['error']}")
 
         # 延伸距離サマリー計算
         cur_params = st.session_state.get("extracted_params") or []
         s_sum = calculate_stretch_summary(cur_params)
+        max_time = get_max_stop_time(cur_params)
 
         # 総延伸距離インストルメント・バナー
         st.markdown(f"""
         <div class="instrument-banner">
             <div>
-                <div class="instrument-title">📏 総延伸量 ΔL</div>
+                <div class="instrument-title">総延伸量 ΔL</div>
                 <div class="instrument-val">{s_sum['total_mm']:.2f} mm <span style="font-size:0.92rem;color:#94a3b8;font-weight:600;">({s_sum['total_um']:,.0f} µm)</span></div>
             </div>
             <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
             <div>
-                <div class="instrument-title">⏱️ 総延伸時間 t_total</div>
-                <div class="instrument-val" style="color:#f1f5f9;">{max([p.get('stop_time_s', 0) for p in cur_params]) if cur_params else 0:.0f} s</div>
+                <div class="instrument-title">総加熱時間 t_total</div>
+                <div class="instrument-val" style="color:#f1f5f9;">{max_time:.0f} s</div>
             </div>
             <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
             <div>
-                <div class="instrument-title">🔢 ステップ数</div>
+                <div class="instrument-title">ステップ数</div>
                 <div class="instrument-val" style="color:#f1f5f9;">{len(cur_params)} ステップ</div>
             </div>
         </div>
@@ -1402,36 +1480,36 @@ elif st.session_state["selected_record_id"] == "NEW":
         sc_col1, sc_col2, sc_col3 = st.columns([1.5, 1.25, 1.25], gap="small")
         with sc_col1:
             step_cnt_input = st.number_input(
-                "🔢 ステップ数",
+                "ステップ数",
                 min_value=1,
                 max_value=30,
                 value=len(cur_params),
                 step=1,
-                key=f"new_step_count_num_{st.session_state['params_version']}",
+                key=f"new_step_count_input_{refresh_tag}",
                 help="ステップ数を変更できます。増やすと直前の条件を引き継いだステップが追加されます。"
             )
             if step_cnt_input != len(cur_params):
                 st.session_state["extracted_params"] = adjust_steps_count(cur_params, step_cnt_input)
-                st.session_state["params_version"] += 1
+                st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
                 st.rerun()
 
         with sc_col2:
             st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            if st.button("➕ ステップ追加", key=f"btn_add_step_new_{st.session_state['params_version']}", use_container_width=True):
+            if st.button("ステップ追加", key=f"btn_add_step_new_{refresh_tag}", use_container_width=True):
                 st.session_state["extracted_params"] = add_step(cur_params)
-                st.session_state["params_version"] += 1
+                st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
                 st.rerun()
 
         with sc_col3:
             st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            if st.button("➖ 最後のステップを削除", key=f"btn_del_step_new_{st.session_state['params_version']}", use_container_width=True, disabled=(len(cur_params) <= 1)):
+            if st.button("最後のステップを削除", key=f"btn_del_step_new_{refresh_tag}", use_container_width=True, disabled=(len(cur_params) <= 1)):
                 st.session_state["extracted_params"] = remove_last_step(cur_params)
-                st.session_state["params_version"] += 1
+                st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
                 st.rerun()
 
         # 延伸パラメータ編集表
         detailed_df = pd.DataFrame(s_sum["steps"])
-        editor_key = f"params_editor_{st.session_state['params_version']}"
+        editor_key = f"params_editor_new_{refresh_tag}"
         edited_df = st.data_editor(
             detailed_df,
             key=editor_key,
@@ -1448,17 +1526,16 @@ elif st.session_state["selected_record_id"] == "NEW":
             hide_index=True
         )
         cleaned_from_table = clean_and_normalize_params(edited_df.drop(columns=["distance_mm"], errors="ignore").to_dict(orient="records"))
-        if len(cleaned_from_table) != len(cur_params):
+        if cleaned_from_table != cur_params:
             st.session_state["extracted_params"] = cleaned_from_table
-            st.session_state["params_version"] += 1
+            if len(cleaned_from_table) != len(cur_params):
+                st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
             st.rerun()
-        else:
-            st.session_state["extracted_params"] = cleaned_from_table
 
         st.write("")
 
         # SEM写真の追加
-        st.markdown('<div class="section-header"><span>🔬 2. SEM写真（電子顕微鏡観察）の追加</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header"><span>2. SEM写真（電子顕微鏡観察）の追加</span></div>', unsafe_allow_html=True)
         sem_up = st.file_uploader(
             "SEM写真をここにドラッグ＆ドロップ",
             type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "heic", "heif"],
@@ -1473,7 +1550,7 @@ elif st.session_state["selected_record_id"] == "NEW":
             try:
                 sem_pil = Image.open(io.BytesIO(st.session_state["sem_image_bytes"]))
                 st.image(sem_pil, caption=f"選択中のSEM写真: {st.session_state.get('sem_image_name', 'SEM画像')}", width="stretch")
-                if st.button("🗑️ SEM写真をクリア", type="secondary"):
+                if st.button("SEM写真をクリア", type="secondary"):
                     st.session_state["sem_image_bytes"] = None
                     st.session_state["sem_image_name"] = None
                     st.rerun()
@@ -1482,7 +1559,7 @@ elif st.session_state["selected_record_id"] == "NEW":
 
     # 【右列】透過率CSV ＆ 規格化グラフ
     with c_right:
-        st.markdown('<div class="section-header"><span>📈 3. 透過率推移 ＆ 規格化グラフ (初期受光強度基準 100%)</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header"><span>3. 透過率推移 ＆ 規格化グラフ (初期受光強度基準 100%)</span></div>', unsafe_allow_html=True)
 
         up_csv = st.file_uploader("透過率CSVをここにドラッグ＆ドロップ", type=["csv", "txt", "dat"], label_visibility="collapsed")
 
@@ -1546,7 +1623,7 @@ elif st.session_state["selected_record_id"] == "NEW":
 
                 c_exp = norm_df[[t_col, "transmittance_pct", "loss_db"]].to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="📥 規格化透過率データ (CSV) をダウンロード",
+                    label="規格化透過率データ (CSV) をダウンロード",
                     data=c_exp,
                     file_name=f"normalized_{st.session_state.get('sample_id', 'NF')}.csv",
                     mime="text/csv",
@@ -1558,7 +1635,7 @@ elif st.session_state["selected_record_id"] == "NEW":
             st.info("ここに透過率CSVファイルをドラッグ＆ドロップしてください。グラフが自動で描画されます。")
 
     st.markdown("---")
-    save_clicked_bottom = st.button("💾 【 作製データを保存 】", type="primary", use_container_width=True, key="save_btn_bottom")
+    save_clicked_bottom = st.button("【 作製データを保存 】 [Sキー]", type="primary", use_container_width=True, key="save_btn_bottom")
 
     # 保存実行処理
     if save_clicked_top or save_clicked_bottom:
@@ -1604,16 +1681,18 @@ elif st.session_state["selected_record_id"] == "NEW":
             sem_photo_path=saved_sem_p,
             total_distance_mm=save_dist_s["total_mm"],
             is_broken=save_broken,
-            recipe_name=st.session_state.get("recipe_name", "").strip()
+            recipe_name=st.session_state.get("recipe_name", "").strip(),
+            fabrication_date=str(st.session_state.get("fabrication_date", datetime.now().date())),
+            temperature=str(st.session_state.get("temperature", "")).strip()
         )
         st.session_state["selected_record_id"] = new_rec_id
-        st.toast(f"🎉 サンプル「{save_name}」を保存しました！", icon="💾")
+        st.toast(f"サンプル「{save_name}」を保存しました！")
         st.rerun()
 
 
 
 # ---------------------------------------------------------
-# パターン B: 📋 選択した過去サンプルの詳細表示 ＆ 【直接編集モード】
+# パターン B: 選択した過去サンプルの詳細表示 ＆ 【直接編集モード】
 # ---------------------------------------------------------
 else:
     rec = db.get_record_by_id(st.session_state["selected_record_id"])
@@ -1626,60 +1705,86 @@ else:
         rec_params = rec["params"]
         is_b = int(rec.get("is_broken", 0))
 
+        raw_fab_date = rec.get("fabrication_date") or rec.get("created_at", "").split(" ")[0]
+        try:
+            def_fab_date = datetime.strptime(raw_fab_date, "%Y-%m-%d").date()
+        except Exception:
+            def_fab_date = datetime.now().date()
+
         # =========================================================
-        # 1. ヘッダー部（編集ボタン不要！その場ですぐに直接変更可能）
+        # 1. ヘッダー部（直接編集可能・日付と温度入力付き）
         # =========================================================
         with st.container(border=True):
-            top1, top2, top3, top4, top5 = st.columns([1.9, 1.8, 1.6, 2.7, 1.4], gap="medium")
+            top1, top2, top3, top4, top5, top6, top7 = st.columns([1.6, 1.2, 1.4, 1.1, 1.5, 2.0, 1.4], gap="small")
             with top1:
                 cur_sample_id = st.text_input(
-                    "🏷️ サンプル識別名 (Sample ID)",
+                    "サンプル識別名 (Sample ID)",
                     value=rec["sample_id"],
                     key=f"rec_sample_id_{rec_id}",
                     help="サンプル識別名を編集して保存できます"
                 )
             with top2:
-                cur_recipe_name = st.text_input(
-                    "📋 作製条件名 (Recipe)",
-                    value=rec.get("recipe_name", ""),
-                    key=f"rec_recipe_{rec_id}",
-                    placeholder="例: 標準条件A, 4段延伸",
-                    help="同一の条件名または同一パラメータのサンプル間で歩留まりが自動集計されます"
+                cur_fab_date = st.date_input(
+                    "作製日 (Date)",
+                    value=def_fab_date,
+                    key=f"rec_date_{rec_id}"
                 )
             with top3:
+                cur_recipe_name = st.text_input(
+                    "作製条件名 (Recipe)",
+                    value=rec.get("recipe_name", ""),
+                    key=f"rec_recipe_{rec_id}",
+                    placeholder="例: 標準条件A",
+                    help="同一の条件名または同一パラメータのサンプル間で歩留まりが自動集計されます"
+                )
+            with top4:
+                cur_temperature = st.text_input(
+                    "加熱温度 (°C)",
+                    value=rec.get("temperature", ""),
+                    key=f"rec_temp_{rec_id}",
+                    placeholder="例: 1200",
+                    help="加熱温度を入力します"
+                )
+            with top5:
                 broken_val = st.radio(
-                    "⚡ 延伸結果 (破断有無)",
-                    ["🟢 正常終了（未破断）", "🔴 延伸中破断"],
+                    "延伸結果 (破断有無)",
+                    ["正常終了 (未破断)", "延伸中破断"],
                     index=1 if is_b else 0,
                     horizontal=True,
                     key=f"rec_broken_radio_{rec_id}"
                 )
-                is_broken_edited = 1 if "🔴" in broken_val else 0
-            with top4:
+                is_broken_edited = 1 if "破断" in broken_val else 0
+            with top6:
                 cur_notes = st.text_input(
-                    "📝 実験備考・所見",
+                    "実験備考・所見",
                     value=rec.get("notes", ""),
                     key=f"rec_notes_{rec_id}",
                     placeholder="加熱炉配置、ファイバ仕様、実験所見など"
                 )
-            with top5:
+            with top7:
                 st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                save_detail_top = st.button("💾 【 変更内容を保存 】", type="primary", use_container_width=True, key=f"save_rec_top_{rec_id}")
+                save_detail_top = st.button("【 変更内容を保存 】 [Sキー]", type="primary", use_container_width=True, key=f"save_rec_top_{rec_id}")
 
-        # サブアクションバー（登録日時、複製、削除）
+        # サブアクションバー（履歴メトリクス、複製、削除）
         sub_c1, sub_c2 = st.columns([1.8, 1.2])
         with sub_c1:
-            status_html = f"<span class='status-pill-broken'>🔴 延伸中破断</span>" if is_broken_edited else f"<span class='status-pill-ok'>🟢 正常終了</span>"
-            st.markdown(f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'><span style='font-size:1.1rem;font-weight:700;color:#f8fafc;'>レコード #{rec_id}</span>{status_html}<span style='color:#94a3b8;font-size:0.83rem;'>登録日時: {rec['created_at']}</span></div>", unsafe_allow_html=True)
+            status_html = f"<span class='status-pill-broken'>[破断] 延伸中破断</span>" if is_broken_edited else f"<span class='status-pill-ok'>[正常] 正常終了</span>"
+            rec_metrics = db.get_record_metrics(rec)
+            date_disp = rec.get("fabrication_date") or rec.get("created_at", "").split(" ")[0]
+            st.markdown(f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'><span style='font-size:1.1rem;font-weight:700;color:#f8fafc;'>レコード #{rec_id}</span>{status_html}<span style='color:#94a3b8;font-size:0.83rem;'>作製日: {date_disp} ｜ 温度: {rec_metrics['temperature_str']} ｜ 総加熱時間: {rec_metrics['total_time_str']} ｜ 延伸距離: {rec_metrics['distance_str']} ｜ 延伸速度: {rec_metrics['speed_str']}</span></div>", unsafe_allow_html=True)
         with sub_c2:
             act1, act2 = st.columns([1.3, 0.9])
             with act1:
-                if st.button("📋 この作製条件を複製して新規作成", use_container_width=True, key=f"btn_clone_{rec_id}"):
-                    st.session_state["extracted_params"] = st.session_state.get(f"rec_params_{rec_id}", rec["params"])
-                    st.session_state["params_version"] += 1
-                    st.session_state["sample_id"] = f"{cur_sample_id.strip()}-rev"
+                if st.button("条件をコピーして新規作成", use_container_width=True, key=f"btn_clone_{rec_id}"):
+                    copied_p = copy.deepcopy(st.session_state.get(f"rec_params_{rec_id}", rec["params"]))
+                    st.session_state["extracted_params"] = copied_p
+                    st.session_state["params_version"] = st.session_state.get("params_version", 0) + 1
+                    st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
+                    st.session_state["sample_id"] = f"{cur_sample_id.strip()}-copy"
                     st.session_state["recipe_name"] = cur_recipe_name.strip()
-                    st.session_state["notes"] = f"ベース: {cur_sample_id.strip()}"
+                    st.session_state["temperature"] = cur_temperature.strip()
+                    st.session_state["fabrication_date"] = cur_fab_date
+                    st.session_state["notes"] = f"元データ: {cur_sample_id.strip()}"
                     st.session_state["is_broken"] = 0
                     st.session_state["selected_record_id"] = "NEW"
                     st.session_state["csv_df"] = None
@@ -1689,12 +1794,13 @@ else:
                     st.session_state["sem_image_name"] = None
                     if "cached_csv_bytes" in st.session_state:
                         del st.session_state["cached_csv_bytes"]
+                    st.toast("作製条件をコピーして新規登録画面を開きました")
                     st.rerun()
             with act2:
-                if st.button("🗑️ 削除", type="secondary", use_container_width=True, key=f"btn_del_{rec_id}"):
+                if st.button("削除", type="secondary", use_container_width=True, key=f"btn_del_{rec_id}"):
                     db.delete_record(rec_id)
                     st.session_state["selected_record_id"] = "NEW"
-                    st.toast("データを削除しました", icon="🗑️")
+                    st.toast("データを削除しました")
                     st.rerun()
 
         # パラメータ取得
@@ -1725,7 +1831,7 @@ else:
         <div class="yield-card">
             <div class="yield-header">
                 <div class="yield-title">
-                    <span>🎯 同一作製条件の実績 ＆ 歩留まり:</span>
+                    <span>同一作製条件の実績 ＆ 歩留まり:</span>
                     <span style="color:#38bdf8;">{cond_label}</span>
                 </div>
                 <div class="yield-sub">同条件作製数: <b>計 {total_same} サンプル</b></div>
@@ -1756,18 +1862,37 @@ else:
         """, unsafe_allow_html=True)
 
         if total_same > 1:
-            st.markdown("<div style='font-size:0.8rem; font-weight:600; color:#94a3b8; margin-top:6px; margin-bottom:4px;'>📌 同一条件作製サンプル一覧:</div>", unsafe_allow_html=True)
+            st.markdown("<div style='font-size:0.8rem; font-weight:600; color:#94a3b8; margin-top:6px; margin-bottom:4px;'>同一条件作製サンプル一覧:</div>", unsafe_allow_html=True)
             pills_cols = st.columns(min(total_same, 5))
             for p_idx, s_info in enumerate(cond_stats["samples"][:5]):
                 col_target = pills_cols[p_idx % len(pills_cols)]
                 with col_target:
-                    s_icon = "🔴" if s_info["is_broken"] else "🟢"
+                    s_icon = "[破断]" if s_info["is_broken"] else "[正常]"
                     s_pct = f"{s_info['final_pct']:.0f}%" if s_info["final_pct"] is not None else ("破断" if s_info["is_broken"] else "-")
                     is_this = (s_info["id"] == rec_id)
-                    btn_text = f"{'👉 ' if is_this else ''}{s_icon} {s_info['sample_id']} ({s_pct})"
+                    btn_text = f"{'[選択中] ' if is_this else ''}{s_icon} {s_info['sample_id']} ({s_pct})"
                     if st.button(btn_text, key=f"btn_jump_same_{s_info['id']}_{rec_id}", disabled=is_this, use_container_width=True):
                         st.session_state["selected_record_id"] = s_info["id"]
                         st.rerun()
+
+        matched_same = [r for r in all_records if db.matches_condition(r, cur_rec_params, cur_recipe_name)]
+        if matched_same:
+            m_list = []
+            for mr in matched_same:
+                m_met = db.get_record_metrics(mr)
+                m_list.append({
+                    "サンプル識別名": mr.get("sample_id"),
+                    "作製日": mr.get("fabrication_date") or mr.get("created_at", "")[:10],
+                    "温度": m_met["temperature_str"],
+                    "総加熱時間": m_met["total_time_str"],
+                    "延伸距離": m_met["distance_str"],
+                    "延伸速度": m_met["speed_str"],
+                    "結果": "延伸中破断" if mr.get("is_broken") else "正常終了",
+                    "最終透過率": f"{mr.get('final_pct'):.1f}%" if mr.get('final_pct') is not None else "-",
+                    "備考": mr.get("notes", "")
+                })
+            with st.expander(f"同一条件サンプルの作製データ履歴（全 {len(m_list)} 件）", expanded=False):
+                st.dataframe(pd.DataFrame(m_list), use_container_width=True, hide_index=True)
 
         st.write("")
 
@@ -1776,25 +1901,26 @@ else:
 
         # 【左列】作製条件パラメータ（直接編集テーブル） ＆ SEM写真
         with d_col_left:
-            st.markdown('<div class="section-header"><span>📋 1. 作製条件パラメータ（表内で直接編集可能）</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header"><span>1. 作製条件パラメータ（表内で直接編集可能）</span></div>', unsafe_allow_html=True)
 
             cur_rec_sum = calculate_stretch_summary(cur_rec_params)
+            max_rec_time = get_max_stop_time(cur_rec_params)
 
             # 延伸距離インストルメント・バナー（リアルタイム自動再計算）
             st.markdown(f"""
             <div class="instrument-banner">
                 <div>
-                    <div class="instrument-title">📏 総延伸量 ΔL</div>
+                    <div class="instrument-title">総延伸量 ΔL</div>
                     <div class="instrument-val">{cur_rec_sum['total_mm']:.2f} mm <span style="font-size:0.92rem;color:#94a3b8;font-weight:600;">({cur_rec_sum['total_um']:,.0f} µm)</span></div>
                 </div>
                 <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
                 <div>
-                    <div class="instrument-title">⏱️ 総延伸時間 t_total</div>
-                    <div class="instrument-val" style="color:#f1f5f9;">{max([p.get('stop_time_s', 0) for p in cur_rec_params]) if cur_rec_params else 0:.0f} s</div>
+                    <div class="instrument-title">総延伸時間 t_total</div>
+                    <div class="instrument-val" style="color:#f1f5f9;">{max_rec_time:.0f} s</div>
                 </div>
                 <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
                 <div>
-                    <div class="instrument-title">🔢 ステップ数</div>
+                    <div class="instrument-title">ステップ数</div>
                     <div class="instrument-val" style="color:#f1f5f9;">{len(cur_rec_params)} ステップ</div>
                 </div>
             </div>
@@ -1805,7 +1931,7 @@ else:
             sc_r1, sc_r2, sc_r3 = st.columns([1.5, 1.25, 1.25], gap="small")
             with sc_r1:
                 step_cnt_rec = st.number_input(
-                    "🔢 ステップ数",
+                    "ステップ数",
                     min_value=1,
                     max_value=30,
                     value=len(cur_rec_params),
@@ -1820,19 +1946,19 @@ else:
 
             with sc_r2:
                 st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                if st.button("➕ ステップ追加", key=f"btn_add_step_rec_{rec_id}_{cur_rec_ver}", use_container_width=True):
+                if st.button("ステップ追加", key=f"btn_add_step_rec_{rec_id}_{cur_rec_ver}", use_container_width=True):
                     st.session_state[rec_params_key] = add_step(cur_rec_params)
                     st.session_state[rec_ver_key] += 1
                     st.rerun()
 
             with sc_r3:
                 st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                if st.button("➖ 最後のステップを削除", key=f"btn_del_step_rec_{rec_id}_{cur_rec_ver}", use_container_width=True, disabled=(len(cur_rec_params) <= 1)):
+                if st.button("最後のステップを削除", key=f"btn_del_step_rec_{rec_id}_{cur_rec_ver}", use_container_width=True, disabled=(len(cur_rec_params) <= 1)):
                     st.session_state[rec_params_key] = remove_last_step(cur_rec_params)
                     st.session_state[rec_ver_key] += 1
                     st.rerun()
 
-            # 直接編集可能な data_editor（ボタンを押さずにそのまま直接編集可能！）
+            # 直接編集可能な data_editor
             edit_df = pd.DataFrame(cur_rec_sum["steps"])
             edited_df = st.data_editor(
                 edit_df,
@@ -1851,12 +1977,10 @@ else:
             )
 
             cleaned_rec_table = clean_and_normalize_params(edited_df.drop(columns=["distance_mm"], errors="ignore").to_dict(orient="records"))
-            if len(cleaned_rec_table) != len(cur_rec_params):
+            if cleaned_rec_table != cur_rec_params:
                 st.session_state[rec_params_key] = cleaned_rec_table
                 st.session_state[rec_ver_key] += 1
                 st.rerun()
-            else:
-                st.session_state[rec_params_key] = cleaned_rec_table
 
             updated_params = cleaned_rec_table
             updated_sum = calculate_stretch_summary(updated_params)
@@ -1864,7 +1988,7 @@ else:
             st.write("")
 
             # 2. SEM写真
-            st.markdown('<div class="section-header"><span>🔬 2. SEM写真（電子顕微鏡観察）</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header"><span>2. SEM写真（電子顕微鏡観察）</span></div>', unsafe_allow_html=True)
             cur_sem_path = rec.get("sem_photo_path")
             delete_sem_flag = False
 
@@ -1872,7 +1996,7 @@ else:
                 try:
                     sem_image_obj = Image.open(cur_sem_path)
                     st.image(sem_image_obj, caption=f"登録SEM写真: {os.path.basename(cur_sem_path)}", width="stretch")
-                    delete_sem_flag = st.checkbox("🗑️ このSEM写真を削除する（保存時に反映）", key=f"chk_del_sem_{rec_id}")
+                    delete_sem_flag = st.checkbox("このSEM写真を削除する（保存時に反映）", key=f"chk_del_sem_{rec_id}")
                 except Exception:
                     st.warning("SEM写真の表示に失敗しました。")
 
@@ -1884,7 +2008,7 @@ else:
 
         # 【右列】透過率グラフ ＆ CSV
         with d_col_right:
-            st.markdown('<div class="section-header"><span>📈 3. 透過率推移 ＆ 規格化グラフ (初期受光強度基準 100%)</span></div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header"><span>3. 透過率推移 ＆ 規格化グラフ (初期受光強度基準 100%)</span></div>', unsafe_allow_html=True)
 
             new_csv_file = st.file_uploader(
                 "新しい透過率CSVファイルをアップロードして差し替え",
@@ -1966,7 +2090,7 @@ else:
                 # CSVダウンロード
                 rec_csv_data = display_df.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="📥 規格化透過率データ (CSV) をダウンロード",
+                    label="規格化透過率データ (CSV) をダウンロード",
                     data=rec_csv_data,
                     file_name=f"normalized_{cur_sample_id.strip() or 'NF'}.csv",
                     mime="text/csv",
@@ -1976,7 +2100,7 @@ else:
                 st.info("このレコードには透過率CSVデータがまだ登録されていません。上のアップローダーから追加できます。")
 
         st.markdown("---")
-        save_detail_bottom = st.button("💾 【 変更内容を保存 】", type="primary", use_container_width=True, key=f"save_rec_bot_{rec_id}")
+        save_detail_bottom = st.button("【 変更内容を保存 】 [Sキー]", type="primary", use_container_width=True, key=f"save_rec_bot_{rec_id}")
 
         # 保存実行処理
         if save_detail_top or save_detail_bottom:
@@ -2004,8 +2128,11 @@ else:
                 initial_val=display_stats.get("initial_val"),
                 final_pct=display_stats.get("final_pct"),
                 min_pct=display_stats.get("min_pct"),
-                recipe_name=cur_recipe_name.strip()
+                recipe_name=cur_recipe_name.strip(),
+                fabrication_date=str(cur_fab_date),
+                temperature=cur_temperature.strip()
             )
-            st.toast(f"🎉 サンプル「{cur_sample_id.strip()}」を保存しました！", icon="💾")
+            st.toast(f"サンプル「{cur_sample_id.strip()}」を保存しました")
             st.rerun()
+
 

@@ -140,7 +140,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Nanofiber起動">
-<title>🔬 Nanofiber Studio - サーバー起動ポータル</title>
+<title>Nanofiber Studio - サーバー起動ポータル</title>
 <style>
   :root {
     --bg: #0b0f17;
@@ -373,7 +373,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 <div class="container">
   <div class="header">
-    <div class="logo-icon">🔬</div>
+    <div class="logo-icon">[NS]</div>
     <div class="title">Nanofiber Studio</div>
     <div class="subtitle">iPhone・モバイル用 リモート起動ポータル</div>
   </div>
@@ -396,7 +396,7 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="guide-card">
-    <div class="guide-title">📲 iPhoneのホーム画面に追加してアプリ化</div>
+    <div class="guide-title">iPhoneのホーム画面に追加してアプリ化</div>
     <ol>
       <li>Safariの画面下部にある <b>共有ボタン（四角から上矢印）</b> をタップ</li>
       <li>メニューから <b>「ホーム画面に追加」</b> を選択</li>
@@ -405,7 +405,7 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="guide-card" style="margin-top: 12px;">
-    <div class="guide-title">⚡ 1タップ起動URL（iOSショートカット対応）</div>
+    <div class="guide-title">1タップ起動URL（iOSショートカット対応）</div>
     <p>下記URLを開くだけで自動起動してアプリに遷移します：</p>
     <div style="margin-top: 6px; word-break: break-all;">
       <a href="/start" style="color:#38bdf8; text-decoration:none;" class="code-pill">http://{{LOCAL_IP}}:8500/start</a>
@@ -442,14 +442,14 @@ function updateUI(status) {
 
     actions.innerHTML = `
       <a href="${APP_URL}" class="btn btn-success">
-        🔬 Nanofiber Studio を開く
+        Nanofiber Studio を開く
       </a>
       <div style="display:flex; gap:10px;">
         <button class="btn btn-secondary" style="flex:1;" onclick="restartServer()">
-          🔄 再起動
+          再起動
         </button>
         <button class="btn btn-danger" style="flex:1;" onclick="stopServer()">
-          ⏹️ 停止
+          停止
         </button>
       </div>
     `;
@@ -460,7 +460,7 @@ function updateUI(status) {
 
     actions.innerHTML = `
       <button class="btn btn-primary" onclick="startServer()">
-        ▶️ サーバーを起動する
+        サーバーを起動する
       </button>
     `;
   }
@@ -486,14 +486,14 @@ async function startServer() {
     const res = await fetch("/api/start");
     const data = await res.json();
     if (data.running) {
-      showToast('✅ 起動完了！Nanofiber Studio に移動します...');
+      showToast('起動完了！Nanofiber Studio に移動します...');
       setTimeout(() => {
         window.location.href = APP_URL;
       }, 1000);
       return;
     }
   } catch (e) {
-    showToast("❌ 起動リクエストでエラーが発生しました");
+    showToast("起動リクエストでエラーが発生しました");
   }
   isOperating = false;
   setTimeout(fetchStatus, 1500);
@@ -505,10 +505,10 @@ async function stopServer() {
   showToast('<div class="spinner"></div> サーバーを停止中...');
   try {
     await fetch("/api/stop");
-    showToast("⏹️ サーバーを停止しました");
+    showToast("サーバーを停止しました");
     setTimeout(hideToast, 2500);
   } catch (e) {
-    showToast("❌ 停止に失敗しました");
+    showToast("停止に失敗しました");
   }
   isOperating = false;
   fetchStatus();
@@ -522,14 +522,14 @@ async function restartServer() {
     const res = await fetch("/api/restart");
     const data = await res.json();
     if (data.running) {
-      showToast('✅ 再起動完了！アプリに移動します...');
+      showToast('再起動完了！アプリに移動します...');
       setTimeout(() => {
         window.location.href = APP_URL;
       }, 1000);
       return;
     }
   } catch (e) {
-    showToast("❌ 再起動でエラーが発生しました");
+    showToast("再起動でエラーが発生しました");
   }
   isOperating = false;
   fetchStatus();
@@ -580,7 +580,7 @@ START_REDIRECT_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <div class="spinner"></div>
-  <h2>🔬 Nanofiber Studio を起動しています</h2>
+  <h2>Nanofiber Studio を起動しています</h2>
   <p>準備ができ次第、自動的にアプリへ移動します...</p>
   <a href="http://{{LOCAL_IP}}:8501">自動で移動しない場合はこちらをタップ</a>
 </body>

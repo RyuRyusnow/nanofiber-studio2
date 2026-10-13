@@ -39,8 +39,13 @@ def run_tests():
     print(f"Plotly Figure created successfully with {len(fig.data)} traces and {len(fig.layout.shapes)} shapes.")
 
     print("=== Testing Database Save & Retrieve ===")
-    records = db.get_all_records()
-    if len(records) == 0:
+    test_db = os.path.join(os.path.dirname(__file__), "_test_logic_temp.db")
+    if os.path.exists(test_db):
+        try:
+            os.remove(test_db)
+        except Exception:
+            pass
+    try:
         csv_cache = {
             "time": df_norm["Time(s)"].tolist(),
             "pct": df_norm["transmittance_pct"].tolist()
@@ -54,12 +59,20 @@ def run_tests():
             initial_val=stats["initial_val"],
             final_pct=stats["final_pct"],
             min_pct=stats["min_pct"],
-            notes="初期サンプル（添付画像条件のプリセットデータ）"
+            notes="初期サンプル（添付画像条件のプリセットデータ）",
+            db_path=test_db
         )
         print(f"Saved initial record with ID: {rec_id}")
-    
-    all_recs = db.get_all_records()
-    print(f"Total records in DB: {len(all_recs)}")
+        
+        all_recs = db.get_all_records(db_path=test_db)
+        print(f"Total records in test DB: {len(all_recs)}")
+        assert len(all_recs) == 1
+    finally:
+        if os.path.exists(test_db):
+            try:
+                os.remove(test_db)
+            except Exception:
+                pass
 
     print("=== Testing Folder Watcher ===")
     status = watcher.check_watch_dir_status()

@@ -43,21 +43,35 @@ def test_edge_cases():
     print("Plot with malformed conditions OK!")
 
     print("--- 5. Testing Database Record without CSV and with NaN/Inf ---")
-    rec_id = db.save_record(
-        sample_id="NF-TEST-NOCSV",
-        params=bad_conditions,
-        photo_path="",
-        csv_path="",
-        csv_data=None,
-        initial_val=float('nan'),
-        final_pct=float('inf'),
-        min_pct=None,
-        notes="Edge case test"
-    )
-    rec = db.get_record_by_id(rec_id)
-    assert rec is not None
-    assert rec["initial_val"] is None
-    print("DB record without CSV & NaN/Inf OK, record:", rec["sample_id"])
+    test_db = os.path.join(os.path.dirname(__file__), "_test_edge_cases_temp.db")
+    if os.path.exists(test_db):
+        try:
+            os.remove(test_db)
+        except Exception:
+            pass
+    try:
+        rec_id = db.save_record(
+            sample_id="NF-TEST-NOCSV",
+            params=bad_conditions,
+            photo_path="",
+            csv_path="",
+            csv_data=None,
+            initial_val=float('nan'),
+            final_pct=float('inf'),
+            min_pct=None,
+            notes="Edge case test",
+            db_path=test_db
+        )
+        rec = db.get_record_by_id(rec_id, db_path=test_db)
+        assert rec is not None
+        assert rec["initial_val"] is None
+        print("DB record without CSV & NaN/Inf OK, record:", rec["sample_id"])
+    finally:
+        if os.path.exists(test_db):
+            try:
+                os.remove(test_db)
+            except Exception:
+                pass
 
     print("--- 6. Testing Image Preparation with RGBA PNG ---")
     rgba_img = Image.new("RGBA", (100, 100), (255, 0, 0, 128))
