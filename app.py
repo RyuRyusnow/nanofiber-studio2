@@ -16,6 +16,7 @@ except ImportError:
     pass
 
 import database as db
+import sync_manager
 import vision_extractor as vision
 import transmittance_analyzer as analyzer
 import folder_watcher as watcher
@@ -861,7 +862,7 @@ if "selected_record_id" not in st.session_state:
 if "cloud_sync_initialized" not in st.session_state:
     st.session_state["cloud_sync_initialized"] = True
     try:
-        sync_res = db.sync_with_cloud()
+        sync_res = sync_manager.sync_with_cloud()
         if sync_res.get("pulled_count", 0) > 0:
             st.toast(f"[自動同期] クラウドから {sync_res['pulled_count']} 件の新規データを取り込みました")
     except Exception:
@@ -1129,7 +1130,7 @@ with st.sidebar:
 
         st.markdown("---")
         st.caption("他PC連携 ＆ クラウドデータ同期 (Google Drive)")
-        sync_dir_curr = db.get_shared_sync_dir()
+        sync_dir_curr = sync_manager.get_shared_sync_dir()
         is_gdrive = "マイドライブ" in sync_dir_curr or "Google" in sync_dir_curr
 
         st.markdown(f"""
@@ -1141,7 +1142,7 @@ with st.sidebar:
 
         if st.button("クラウドと今すぐ同期", type="primary", use_container_width=True, key="btn_sync_now_sidebar"):
             with st.spinner("クラウド (Google Drive) と同期中..."):
-                sync_res = db.sync_with_cloud()
+                sync_res = sync_manager.sync_with_cloud()
                 if sync_res.get("success"):
                     p_cnt = sync_res.get("pulled_count", 0)
                     u_cnt = sync_res.get("updated_count", 0)
@@ -1151,7 +1152,7 @@ with st.sidebar:
                 else:
                     st.error(f"同期エラー: {sync_res.get('error')}")
 
-        all_json_str = db.export_all_records_json()
+        all_json_str = sync_manager.export_all_records_json()
         st.download_button(
             "全データのエクスポート (.json)",
             data=all_json_str.encode("utf-8"),
@@ -1181,7 +1182,7 @@ with st.sidebar:
                 if st.button("このデータを取り込み・統合する", use_container_width=True, key="btn_run_import_merge"):
                     fname = import_file.name.lower()
                     if fname.endswith(".json"):
-                        res = db.import_records_from_json(import_file.getvalue().decode("utf-8", errors="replace"))
+                        res = sync_manager.import_records_from_json(import_file.getvalue().decode("utf-8", errors="replace"))
                     else:
                         tmp_p = os.path.join(DB_DIR, "_temp_import.db")
                         with open(tmp_p, "wb") as f:
@@ -2139,7 +2140,7 @@ else:
             # 2. SEM写真
             st.markdown('<div class="section-header"><span>2. SEM写真（電子顕微鏡観察）</span></div>', unsafe_allow_html=True)
             cur_sem_path = rec.get("sem_photo_path")
-            resolved_sem = db.resolve_media_file(cur_sem_path)
+            resolved_sem = sync_manager.resolve_media_file(cur_sem_path)
             delete_sem_flag = False
 
             if resolved_sem and os.path.exists(resolved_sem):
