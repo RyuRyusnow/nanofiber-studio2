@@ -19,6 +19,7 @@ import database as db
 import vision_extractor as vision
 import transmittance_analyzer as analyzer
 import folder_watcher as watcher
+import temperature_converter as temp_conv
 
 def process_uploaded_image_bytes(raw_bytes: bytes, filename: str) -> tuple[bytes, str]:
     """HEIC/HEIF画像がアップロードされた場合、汎用PNGバイトに安全変換する"""
@@ -166,9 +167,10 @@ def safe_int(v, default=1):
         return default
 
 def calculate_stretch_summary(params: list) -> dict:
-    """各ステップの延伸距離と全体の総延伸距離を計算（欠損値やNaNに対して完全堅牢）"""
+    """各ステップの延伸距離と全体の総延伸距離、および換算加熱温度を計算（欠損値やNaNに対して完全堅牢）"""
     total_um = 0.0
     steps_detailed = []
+    max_c = 0.0
     for idx, p in enumerate(params or []):
         if not isinstance(p, dict):
             continue
@@ -181,18 +183,28 @@ def calculate_stretch_summary(params: list) -> dict:
         total_um += dist_um
         step_val = p.get("step")
         step_num = safe_int(step_val, idx + 1)
+        curr = safe_num(p.get("current_A"), 6.0)
+        if curr > max_c:
+            max_c = curr
+        conv_t = temp_conv.convert_current_to_temperature(curr, round_digits=0)
+        conv_t_str = f"{conv_t:.0f} °C" if conv_t is not None and conv_t > 0 else "-"
         steps_detailed.append({
             "step": step_num,
-            "current_A": safe_num(p.get("current_A"), 6.0),
+            "current_A": curr,
+            "converted_temp_C": conv_t_str,
             "speed_ums": spd,
             "start_time_s": t_start,
             "stop_time_s": t_stop,
             "distance_mm": round(dist_mm, 2)
         })
     total_mm = total_um / 1000.0
+    max_t = temp_conv.convert_current_to_temperature(max_c, round_digits=0) if max_c > 0 else None
     return {
         "total_um": total_um,
         "total_mm": round(total_mm, 2),
+        "max_current_A": max_c,
+        "max_temp_C": max_t,
+        "max_temp_str": f"{max_t:.0f} °C" if max_t is not None and max_t > 0 else "-",
         "steps": steps_detailed
     }
 
@@ -1054,6 +1066,33 @@ with st.sidebar:
             label_visibility="collapsed"
         )
 
+    # 6.5. ヒーター電流 ⇄ 温度 換算電卓
+    with st.expander("ヒーター電流 ⇄ 温度 換算電卓", expanded=False):
+        c_mode = st.radio("換算方向", ["電流 (A) -> 温度 (°C)", "温度 (°C) -> 電流 (A)"], horizontal=True, label_visibility="collapsed")
+        if "電流 (A)" in c_mode:
+            in_curr = st.number_input("電流 I (A)", min_value=0.0, max_value=10.0, value=6.000, step=0.05, format="%.3f", key="sb_conv_in_curr")
+            out_t = temp_conv.convert_current_to_temperature(in_curr)
+            st.markdown(f"""
+            <div style="background:#1e293b; border:1px solid #38bdf8; border-radius:8px; padding:10px; text-align:center; margin:8px 0;">
+                <div style="color:#94a3b8; font-size:0.75rem;">自動換算温度 (Temperature)</div>
+                <div style="color:#38bdf8; font-size:1.4rem; font-weight:700;">{out_t:.1f} °C</div>
+                <div style="color:#64748b; font-size:0.72rem;">(約 {out_t:.0f} °C)</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            in_temp = st.number_input("温度 T (°C)", min_value=0.0, max_value=2000.0, value=1400.0, step=10.0, format="%.1f", key="sb_conv_in_temp")
+            out_c = temp_conv.convert_temperature_to_current(in_temp)
+            st.markdown(f"""
+            <div style="background:#1e293b; border:1px solid #34d399; border-radius:8px; padding:10px; text-align:center; margin:8px 0;">
+                <div style="color:#94a3b8; font-size:0.75rem;">必要ヒーター電流 (Current)</div>
+                <div style="color:#34d399; font-size:1.4rem; font-weight:700;">{out_c:.3f} A</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with st.expander("校正データ ＆ 換算グラフ", expanded=False):
+            st.plotly_chart(temp_conv.create_calibration_chart(highlight_current=in_curr if "電流 (A)" in c_mode else out_c), use_container_width=True, config={"displayModeBar": False})
+            st.dataframe(temp_conv.get_calibration_dataframe(), use_container_width=True, hide_index=True)
+
     # 7. サイドバー最下部: 設定 (Settings)
     st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
     with st.expander("設定 (Settings)", expanded=False):
@@ -1316,12 +1355,24 @@ elif st.session_state["selected_record_id"] == "NEW":
             )
             st.session_state["fabrication_date"] = picked_date
         with row1_c3:
+            cur_p_list = st.session_state.get("extracted_params") or []
+            max_c_val = max([safe_num(p.get("current_A")) for p in cur_p_list if isinstance(p, dict)] or [0.0])
+            conv_t_val = temp_conv.convert_current_to_temperature(max_c_val, round_digits=0) if max_c_val > 0 else None
+            conv_t_str = f"{conv_t_val:.0f}" if conv_t_val else ""
+
+            # 初期値：セッションに値が空で換算値があれば自動反映
+            raw_temp_val = st.session_state.get("temperature", "")
+            if not raw_temp_val and conv_t_str:
+                raw_temp_val = conv_t_str
+                st.session_state["temperature"] = raw_temp_val
+
+            temp_help = f"ヒーター電流 {max_c_val:.3f}A より自動換算: {conv_t_str}°C" if conv_t_str else "加熱炉温度（°C）を入力します"
             st.session_state["temperature"] = st.text_input(
                 "加熱温度 (°C)",
                 value=st.session_state.get("temperature", ""),
-                placeholder="例: 1250",
+                placeholder=f"自動換算: {conv_t_str}°C" if conv_t_str else "例: 1400",
                 key=f"temp_new_{refresh_tag}",
-                help="加熱炉温度（°C）または設定温度を入力できます"
+                help=temp_help
             )
 
         row2_c1, row2_c2, row2_c3, row2_c4 = st.columns([1.5, 1.3, 2.0, 1.4], gap="medium")
@@ -1404,6 +1455,40 @@ elif st.session_state["selected_record_id"] == "NEW":
     with c_left:
         st.markdown('<div class="section-header"><span>1. 作製条件パラメータ</span></div>', unsafe_allow_html=True)
 
+        # ヒーター電流 ⇄ 温度 リアルタイム換算ツール
+        with st.expander("ヒーター電流 ⇄ 加熱温度 リアルタイム換算ツール ＆ 校正特性", expanded=False):
+            tc_c1, tc_c2, tc_c3 = st.columns([1.5, 2.0, 1.4], gap="medium")
+            with tc_c1:
+                cur_step_c = float(s_sum.get("max_current_A") or 6.000)
+                calc_in_c = st.number_input(
+                    "ヒーター電流 I (A)",
+                    min_value=0.0,
+                    max_value=10.0,
+                    value=cur_step_c,
+                    step=0.05,
+                    format="%.3f",
+                    key=f"live_conv_curr_a_{refresh_tag}"
+                )
+            with tc_c2:
+                calc_out_t = temp_conv.convert_current_to_temperature(calc_in_c, round_digits=1)
+                st.markdown(f"""
+                <div style="background:#1e293b; border:1px solid #38bdf8; border-radius:8px; padding:6px 12px; margin-top:8px;">
+                    <div style="color:#94a3b8; font-size:0.75rem;">自動換算温度:</div>
+                    <div style="color:#38bdf8; font-size:1.25rem; font-weight:700;">{calc_out_t:.1f} °C <span style="font-size:0.8rem; color:#94a3b8; font-weight:400;">(約 {calc_out_t:.0f} °C)</span></div>
+                </div>
+                """, unsafe_allow_html=True)
+            with tc_c3:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                if st.button("この温度を入力欄に適用", key=f"btn_apply_t_left_a_{refresh_tag}", use_container_width=True):
+                    st.session_state["temperature"] = f"{calc_out_t:.0f}"
+                    st.toast(f"加熱温度を {calc_out_t:.0f} °C に設定しました")
+                    st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
+                    st.rerun()
+
+            with st.expander("電流-温度 換算曲線 ＆ 校正基準点（グラフ）", expanded=False):
+                st.plotly_chart(temp_conv.create_calibration_chart(highlight_current=calc_in_c), use_container_width=True, config={"displayModeBar": False})
+                st.dataframe(temp_conv.get_calibration_dataframe(), use_container_width=True, hide_index=True)
+
         with st.expander("モニタ写真から作製条件を自動抽出 (AI OCR)", expanded=False):
             r_c1, r_c2 = st.columns([2, 1])
             with r_c1:
@@ -1469,6 +1554,11 @@ elif st.session_state["selected_record_id"] == "NEW":
             </div>
             <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
             <div>
+                <div class="instrument-title">換算加熱温度 T_conv</div>
+                <div class="instrument-val" style="color:#fbbf24;">{s_sum['max_temp_str']}</div>
+            </div>
+            <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
+            <div>
                 <div class="instrument-title">ステップ数</div>
                 <div class="instrument-val" style="color:#f1f5f9;">{len(cur_params)} ステップ</div>
             </div>
@@ -1516,6 +1606,7 @@ elif st.session_state["selected_record_id"] == "NEW":
             column_config={
                 "step": st.column_config.NumberColumn("ステップ No.", format="%d", min_value=1, step=1, width="small"),
                 "current_A": st.column_config.NumberColumn("加熱電流 I (A)", format="%.3f A"),
+                "converted_temp_C": st.column_config.TextColumn("換算温度", disabled=True, width="small", help="ヒーター電流から自動換算された温度 (°C)"),
                 "speed_ums": st.column_config.NumberColumn("延伸速度 v (µm/s)", format="%.0f µm/s"),
                 "start_time_s": st.column_config.NumberColumn("開始時刻 t_start (s)", format="%.1f s"),
                 "stop_time_s": st.column_config.NumberColumn("終了時刻 t_stop (s)", format="%.1f s"),
@@ -1525,7 +1616,7 @@ elif st.session_state["selected_record_id"] == "NEW":
             use_container_width=True,
             hide_index=True
         )
-        cleaned_from_table = clean_and_normalize_params(edited_df.drop(columns=["distance_mm"], errors="ignore").to_dict(orient="records"))
+        cleaned_from_table = clean_and_normalize_params(edited_df.drop(columns=["distance_mm", "converted_temp_C"], errors="ignore").to_dict(orient="records"))
         if cleaned_from_table != cur_params:
             st.session_state["extracted_params"] = cleaned_from_table
             if len(cleaned_from_table) != len(cur_params):
@@ -1738,12 +1829,21 @@ else:
                     help="同一の条件名または同一パラメータのサンプル間で歩留まりが自動集計されます"
                 )
             with top4:
+                rec_p_list = cur_rec_params or []
+                rec_max_c = max([safe_num(p.get("current_A")) for p in rec_p_list if isinstance(p, dict)] or [0.0])
+                rec_conv_t = temp_conv.convert_current_to_temperature(rec_max_c, round_digits=0) if rec_max_c > 0 else None
+                rec_conv_str = f"{rec_conv_t:.0f}" if rec_conv_t else ""
+
+                raw_rec_t = rec.get("temperature", "")
+                if not raw_rec_t and rec_conv_str:
+                    raw_rec_t = rec_conv_str
+
                 cur_temperature = st.text_input(
                     "加熱温度 (°C)",
-                    value=rec.get("temperature", ""),
+                    value=raw_rec_t,
                     key=f"rec_temp_{rec_id}",
-                    placeholder="例: 1200",
-                    help="加熱温度を入力します"
+                    placeholder=f"自動換算: {rec_conv_str}°C" if rec_conv_str else "例: 1400",
+                    help=f"ヒーター電流 {rec_max_c:.3f}A より自動換算: {rec_conv_str}°C" if rec_conv_str else "加熱温度を入力します"
                 )
             with top5:
                 broken_val = st.radio(
@@ -1903,6 +2003,39 @@ else:
         with d_col_left:
             st.markdown('<div class="section-header"><span>1. 作製条件パラメータ（表内で直接編集可能）</span></div>', unsafe_allow_html=True)
 
+            # ヒーター電流 ⇄ 温度 リアルタイム換算ツール
+            with st.expander("ヒーター電流 ⇄ 加熱温度 リアルタイム換算ツール ＆ 校正特性", expanded=False):
+                rtc_c1, rtc_c2, rtc_c3 = st.columns([1.5, 2.0, 1.4], gap="medium")
+                with rtc_c1:
+                    init_rec_c = float(rec_max_c if rec_max_c > 0 else 6.000)
+                    r_calc_in_c = st.number_input(
+                        "ヒーター電流 I (A)",
+                        min_value=0.0,
+                        max_value=10.0,
+                        value=init_rec_c,
+                        step=0.05,
+                        format="%.3f",
+                        key=f"live_conv_curr_b_{rec_id}_{cur_rec_ver}"
+                    )
+                with rtc_c2:
+                    r_calc_out_t = temp_conv.convert_current_to_temperature(r_calc_in_c, round_digits=1)
+                    st.markdown(f"""
+                    <div style="background:#1e293b; border:1px solid #38bdf8; border-radius:8px; padding:6px 12px; margin-top:8px;">
+                        <div style="color:#94a3b8; font-size:0.75rem;">自動換算温度:</div>
+                        <div style="color:#38bdf8; font-size:1.25rem; font-weight:700;">{r_calc_out_t:.1f} °C <span style="font-size:0.8rem; color:#94a3b8; font-weight:400;">(約 {r_calc_out_t:.0f} °C)</span></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with rtc_c3:
+                    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                    if st.button("この温度を入力欄に適用", key=f"btn_apply_t_left_b_{rec_id}_{cur_rec_ver}", use_container_width=True):
+                        st.session_state[f"rec_temp_{rec_id}"] = f"{r_calc_out_t:.0f}"
+                        st.toast(f"加熱温度を {r_calc_out_t:.0f} °C に設定しました")
+                        st.rerun()
+
+                with st.expander("電流-温度 換算曲線 ＆ 校正基準点（グラフ）", expanded=False):
+                    st.plotly_chart(temp_conv.create_calibration_chart(highlight_current=r_calc_in_c), use_container_width=True, config={"displayModeBar": False})
+                    st.dataframe(temp_conv.get_calibration_dataframe(), use_container_width=True, hide_index=True)
+
             cur_rec_sum = calculate_stretch_summary(cur_rec_params)
             max_rec_time = get_max_stop_time(cur_rec_params)
 
@@ -1915,8 +2048,13 @@ else:
                 </div>
                 <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
                 <div>
-                    <div class="instrument-title">総延伸時間 t_total</div>
+                    <div class="instrument-title">総加熱時間 t_total</div>
                     <div class="instrument-val" style="color:#f1f5f9;">{max_rec_time:.0f} s</div>
+                </div>
+                <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
+                <div>
+                    <div class="instrument-title">換算加熱温度 T_conv</div>
+                    <div class="instrument-val" style="color:#fbbf24;">{cur_rec_sum['max_temp_str']}</div>
                 </div>
                 <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
                 <div>
@@ -1966,6 +2104,7 @@ else:
                 column_config={
                     "step": st.column_config.NumberColumn("ステップ No.", format="%d", min_value=1, step=1, width="small"),
                     "current_A": st.column_config.NumberColumn("加熱電流 I (A)", format="%.3f A"),
+                    "converted_temp_C": st.column_config.TextColumn("換算温度", disabled=True, width="small", help="ヒーター電流から自動換算された温度 (°C)"),
                     "speed_ums": st.column_config.NumberColumn("延伸速度 v (µm/s)", format="%.0f µm/s"),
                     "start_time_s": st.column_config.NumberColumn("開始時刻 t_start (s)", format="%.1f s"),
                     "stop_time_s": st.column_config.NumberColumn("終了時刻 t_stop (s)", format="%.1f s"),
@@ -1976,7 +2115,7 @@ else:
                 hide_index=True
             )
 
-            cleaned_rec_table = clean_and_normalize_params(edited_df.drop(columns=["distance_mm"], errors="ignore").to_dict(orient="records"))
+            cleaned_rec_table = clean_and_normalize_params(edited_df.drop(columns=["distance_mm", "converted_temp_C"], errors="ignore").to_dict(orient="records"))
             if cleaned_rec_table != cur_rec_params:
                 st.session_state[rec_params_key] = cleaned_rec_table
                 st.session_state[rec_ver_key] += 1

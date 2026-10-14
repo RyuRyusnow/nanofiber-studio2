@@ -5,6 +5,7 @@ import os
 import numpy as np
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from temperature_converter import convert_current_to_temperature
 
 DB_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(DB_DIR, "nanofiber_data.db")
@@ -361,12 +362,16 @@ def get_record_metrics(rec: dict) -> dict:
             "speed_str": "0µm/s"
         }
     params = rec.get("params") or []
-    # 1. 温度
+    # 1. 温度 (手動入力値があれば優先、未入力ならヒーター電流から自動換算)
     temp_val = str(rec.get("temperature") or "").strip()
     if not temp_val:
         currents = [safe_num(p.get("current_A")) for p in params if isinstance(p, dict) and safe_num(p.get("current_A")) > 0]
         if currents:
-            temp_val = f"{currents[0]:.3f}A"
+            conv_t = convert_current_to_temperature(currents[0])
+            if conv_t is not None and conv_t > 0:
+                temp_val = f"{conv_t:.0f}℃"
+            else:
+                temp_val = f"{currents[0]:.3f}A"
         else:
             temp_val = "-"
     elif not temp_val.endswith("℃") and not temp_val.endswith("°C") and temp_val.replace(".", "", 1).isdigit():
