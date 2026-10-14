@@ -76,8 +76,16 @@ def init_app_database():
 init_app_database()
 
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-SEM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sem_photos")
+DB_DIR = os.path.dirname(os.path.abspath(__file__))
+SEM_DIR = os.path.join(DB_DIR, "sem_photos")
 os.makedirs(SEM_DIR, exist_ok=True)
+
+DEFAULT_PARAMS = [
+    {"step": 1, "current_A": 6.000, "speed_ums": 0.0, "start_time_s": 0.0, "stop_time_s": 160.0},
+    {"step": 2, "current_A": 5.900, "speed_ums": 225.0, "start_time_s": 160.0, "stop_time_s": 230.0},
+    {"step": 3, "current_A": 6.000, "speed_ums": 0.0, "start_time_s": 230.0, "stop_time_s": 430.0},
+    {"step": 4, "current_A": 5.900, "speed_ums": 225.0, "start_time_s": 430.0, "stop_time_s": 530.0},
+]
 
 def load_env_key() -> str:
     """Streamlit Secrets、環境変数、または .env ファイルから API キーを読み込む"""
@@ -838,12 +846,7 @@ if "editor_refresh_id" not in st.session_state:
     st.session_state["editor_refresh_id"] = 0
 
 if "extracted_params" not in st.session_state:
-    st.session_state["extracted_params"] = [
-        {"step": 1, "current_A": 6.000, "speed_ums": 0.0, "start_time_s": 0.0, "stop_time_s": 160.0},
-        {"step": 2, "current_A": 5.900, "speed_ums": 225.0, "start_time_s": 160.0, "stop_time_s": 230.0},
-        {"step": 3, "current_A": 6.000, "speed_ums": 0.0, "start_time_s": 230.0, "stop_time_s": 430.0},
-        {"step": 4, "current_A": 5.900, "speed_ums": 225.0, "start_time_s": 430.0, "stop_time_s": 530.0},
-    ]
+    st.session_state["extracted_params"] = copy.deepcopy(DEFAULT_PARAMS)
 if "params_version" not in st.session_state:
     st.session_state["params_version"] = 0
 if "csv_df" not in st.session_state:
@@ -899,6 +902,7 @@ with st.sidebar:
         st.session_state["csv_df"] = None
         st.session_state["csv_stats"] = {}
         st.session_state["csv_file_name"] = None
+        st.session_state["extracted_params"] = copy.deepcopy(DEFAULT_PARAMS)
         st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
         if "cached_csv_bytes" in st.session_state:
             del st.session_state["cached_csv_bytes"]
@@ -1813,6 +1817,17 @@ else:
         except Exception:
             def_fab_date = datetime.now().date()
 
+        # パラメータ取得（ヘッダー部での自動換算および歩留まり集計に使用）
+        rec_params_key = f"rec_params_{rec_id}"
+        rec_ver_key = f"rec_ver_{rec_id}"
+        if rec_params_key not in st.session_state:
+            st.session_state[rec_params_key] = rec["params"]
+        if rec_ver_key not in st.session_state:
+            st.session_state[rec_ver_key] = 0
+
+        cur_rec_params = st.session_state[rec_params_key]
+        cur_rec_ver = st.session_state[rec_ver_key]
+
         # =========================================================
         # 1. ヘッダー部（直接編集可能・日付と温度入力付き）
         # =========================================================
@@ -1847,7 +1862,7 @@ else:
 
                 raw_rec_t = rec.get("temperature", "")
                 if not raw_rec_t and rec_conv_str:
-                    raw_rec_t = rec_conv_str
+                    raw_rec_t = f"{rec_conv_str}℃"
 
                 cur_temperature = st.text_input(
                     "加熱温度 (°C)",
@@ -1887,7 +1902,7 @@ else:
             act1, act2 = st.columns([1.3, 0.9])
             with act1:
                 if st.button("条件をコピーして新規作成", use_container_width=True, key=f"btn_clone_{rec_id}"):
-                    copied_p = copy.deepcopy(st.session_state.get(f"rec_params_{rec_id}", rec["params"]))
+                    copied_p = copy.deepcopy(cur_rec_params)
                     st.session_state["extracted_params"] = copied_p
                     st.session_state["params_version"] = st.session_state.get("params_version", 0) + 1
                     st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
@@ -1913,17 +1928,6 @@ else:
                     st.session_state["selected_record_id"] = "NEW"
                     st.toast("データを削除しました")
                     st.rerun()
-
-        # パラメータ取得
-        rec_params_key = f"rec_params_{rec_id}"
-        rec_ver_key = f"rec_ver_{rec_id}"
-        if rec_params_key not in st.session_state:
-            st.session_state[rec_params_key] = rec["params"]
-        if rec_ver_key not in st.session_state:
-            st.session_state[rec_ver_key] = 0
-
-        cur_rec_params = st.session_state[rec_params_key]
-        cur_rec_ver = st.session_state[rec_ver_key]
 
         # 同一条件での歩留まり集計
         cond_stats = db.get_condition_yield_stats(all_records, cur_rec_params, cur_recipe_name)
@@ -2129,7 +2133,8 @@ else:
             cleaned_rec_table = clean_and_normalize_params(edited_df.drop(columns=["distance_mm", "converted_temp_C"], errors="ignore").to_dict(orient="records"))
             if cleaned_rec_table != cur_rec_params:
                 st.session_state[rec_params_key] = cleaned_rec_table
-                st.session_state[rec_ver_key] += 1
+                if len(cleaned_rec_table) != len(cur_rec_params):
+                    st.session_state[rec_ver_key] += 1
                 st.rerun()
 
             updated_params = cleaned_rec_table
@@ -2286,7 +2291,7 @@ else:
                 min_pct=display_stats.get("min_pct"),
                 recipe_name=cur_recipe_name.strip(),
                 fabrication_date=str(cur_fab_date),
-                temperature=cur_temperature.strip()
+                temperature=(cur_temperature.strip() if cur_temperature else "") or (f"{rec_conv_str}℃" if rec_conv_str else "")
             )
             st.toast(f"サンプル「{cur_sample_id.strip()}」を保存しました")
             st.rerun()
