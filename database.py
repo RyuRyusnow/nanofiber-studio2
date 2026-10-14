@@ -114,7 +114,15 @@ def merge_databases(source_db_path: str, target_db_path: str = DB_PATH) -> Dict[
     except Exception as e:
         return {"success": False, "error": f"データベースマージ失敗: {str(e)}"}
 
-    temp_path = DB_PATH + ".temp"
+def get_db_bytes(db_path: str = DB_PATH) -> bytes:
+    """データベースファイル（nanofiber_data.db）をバイト列として取得"""
+    init_db(db_path)
+    with open(db_path, "rb") as f:
+        return f.read()
+
+def restore_db_from_bytes(data: bytes, db_path: str = DB_PATH) -> bool:
+    """アップロードされたデータからデータベースを安全に復元・検証"""
+    temp_path = db_path + ".temp"
     try:
         with open(temp_path, "wb") as f:
             f.write(data)
@@ -122,10 +130,10 @@ def merge_databases(source_db_path: str, target_db_path: str = DB_PATH) -> Dict[
             cursor = test_conn.cursor()
             cursor.execute("SELECT count(*) FROM fabrication_records")
             cursor.fetchone()
-        if os.path.exists(DB_PATH):
-            os.replace(temp_path, DB_PATH)
+        if os.path.exists(db_path):
+            os.replace(temp_path, db_path)
         else:
-            os.rename(temp_path, DB_PATH)
+            os.rename(temp_path, db_path)
         return True
     except Exception:
         if os.path.exists(temp_path):
