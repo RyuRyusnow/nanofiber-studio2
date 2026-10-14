@@ -12,6 +12,7 @@ LOCAL_DB_PATH = os.path.join(DB_DIR, "nanofiber_data.db")
 LOCAL_SEM_DIR = os.path.join(DB_DIR, "sem_photos")
 LOCAL_SAMPLE_DIR = os.path.join(DB_DIR, "sample_data")
 LOCAL_BACKUP_JSON = os.path.join(DB_DIR, "nanofiber_local_backup.json")
+TOMBSTONES_FILE = os.path.join(DB_DIR, "nanofiber_tombstones.json")
 
 # 可能な Google Drive / クラウド共有同期パスの候補リスト
 POTENTIAL_SYNC_PATHS = [
@@ -22,6 +23,112 @@ POTENTIAL_SYNC_PATHS = [
     os.path.join(os.environ.get("USERPROFILE", ""), "マイドライブ", "nanofiber_sync"),
     r"G:\その他のパソコン\nanofiber_sync",
 ]
+
+def load_tombstones() -> set:
+    """削除されたレコードのキー一覧（墓石）をロード"""
+    if os.path.exists(TOMBSTONES_FILE):
+        try:
+            with open(TOMBSTONES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return set(data)
+                elif isinstance(data, dict):
+                    return set(data.get("deleted_keys", []))
+        except Exception:
+            pass
+    return set()
+
+def save_tombstones(tombstones: set) -> None:
+    """削除されたレコードのキー一覧を保存"""
+    try:
+        with open(TOMBSTONES_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(tombstones)), f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def unregister_tombstone(sample_id: str, fab_date: str = "", created_at: str = "") -> None:
+    """レコードが新規作成・保存された際、過去の削除墓石を解除"""
+    key = make_record_key(sample_id, fab_date, created_at)
+    s_clean = str(sample_id or "").strip().lower()
+    tombstones = load_tombstones()
+    changed = False
+    if key in tombstones:
+        tombstones.remove(key)
+        changed = True
+    if s_clean in tombstones:
+        tombstones.remove(s_clean)
+        changed = True
+    if changed:
+        save_tombstones(tombstones)
+
+def register_record_deletion(sample_id: str, fab_date: str = "", created_at: str = "", db_path: str = LOCAL_DB_PATH, sync_dir: Optional[str] = None) -> None:
+    """レコード削除を登録し、クラウドマスターおよび共有DBからも即座に消去"""
+    key = make_record_key(sample_id, fab_date, created_at)
+    s_clean = str(sample_id or "").strip().lower()
+    tombstones = load_tombstones()
+    tombstones.add(key)
+    tombstones.add(s_clean)
+    save_tombstones(tombstones)
+
+    s_dir = sync_dir or get_shared_sync_dir()
+    master_json_path = os.path.join(s_dir, "nanofiber_sync_master.json")
+    if os.path.exists(master_json_path):
+        try:
+            with open(master_json_path, "r", encoding="utf-8") as f:
+                cloud_data = json.load(f)
+            if isinstance(cloud_data, dict):
+                recs = cloud_data.get("records", [])
+                filtered = [
+                    r for r in recs
+                    if make_record_key(r.get("sample_id"), r.get("fabrication_date"), r.get("created_at")) != key
+                    and str(r.get("sample_id") or "").strip().lower() != s_clean
+                ]
+                cloud_data["records"] = filtered
+                cloud_deleted = set(cloud_data.get("deleted_keys", []))
+                cloud_deleted.add(key)
+                cloud_deleted.add(s_clean)
+                cloud_data["deleted_keys"] = sorted(list(cloud_deleted))
+                cloud_data["total_records"] = len(filtered)
+                cloud_data["last_synced_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open(master_json_path, "w", encoding="utf-8") as f:
+                    json.dump(cloud_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # クラウド共有SQLiteデータベース(nanofiber_shared.db)からも即時削除
+    shared_db_path = os.path.join(s_dir, "nanofiber_shared.db")
+    if os.path.exists(shared_db_path):
+        try:
+            with sqlite3.connect(shared_db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM fabrication_records WHERE LOWER(sample_id) = ?", (s_clean,))
+                conn.commit()
+        except Exception:
+            pass
+
+    # ローカルバックアップJSONからも即時削除
+    if os.path.exists(LOCAL_BACKUP_JSON):
+        try:
+            with open(LOCAL_BACKUP_JSON, "r", encoding="utf-8") as f:
+                lb_data = json.load(f)
+            if isinstance(lb_data, dict):
+                recs = lb_data.get("records", [])
+                filtered = [
+                    r for r in recs
+                    if make_record_key(r.get("sample_id"), r.get("fabrication_date"), r.get("created_at")) != key
+                    and str(r.get("sample_id") or "").strip().lower() != s_clean
+                ]
+                lb_data["records"] = filtered
+                lb_deleted = set(lb_data.get("deleted_keys", []))
+                lb_deleted.add(key)
+                lb_deleted.add(s_clean)
+                lb_data["deleted_keys"] = sorted(list(lb_deleted))
+                lb_data["total_records"] = len(filtered)
+                lb_data["last_synced_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with open(LOCAL_BACKUP_JSON, "w", encoding="utf-8") as f:
+                    json.dump(lb_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 def clean_for_json(obj: Any) -> Any:
     """NaN や Inf など非準拠の浮動小数点数を安全に None / 0.0 に変換"""
@@ -144,10 +251,9 @@ def sync_with_cloud(
     master_json_path = os.path.join(sync_dir, "nanofiber_sync_master.json")
     shared_db_path = os.path.join(sync_dir, "nanofiber_shared.db")
 
-    # 1. ローカルレコードを全件取得（CSVデータも含む）
-    local_records = db_mod.get_all_records(include_csv_data=True, db_path=db_path)
-
-    # 2. クラウド側のマスターJSONを読み込み
+    # 1. 削除墓石（tombstones）の読み込みと統合
+    tombstones = load_tombstones()
+    cloud_deleted = set()
     cloud_records = []
     if os.path.exists(master_json_path):
         try:
@@ -155,10 +261,14 @@ def sync_with_cloud(
                 cloud_data = json.load(f)
                 if isinstance(cloud_data, dict):
                     cloud_records = cloud_data.get("records", [])
+                    cloud_deleted = set(cloud_data.get("deleted_keys", []))
                 elif isinstance(cloud_data, list):
                     cloud_records = cloud_data
         except Exception:
             cloud_records = []
+
+    merged_tombstones = tombstones | cloud_deleted
+    save_tombstones(merged_tombstones)
 
     # クラウド側が空で shared_db_path が存在する場合はそちらからも補完
     if not cloud_records and os.path.exists(shared_db_path):
@@ -167,23 +277,39 @@ def sync_with_cloud(
         except Exception:
             pass
 
+    # 2. ローカルレコードを全件取得（CSVデータも含む）
+    local_records = db_mod.get_all_records(include_csv_data=True, db_path=db_path)
+
+    # ローカル辞書マップの構築（削除済み墓石に該当するものはローカルDBからも抹消）
+    local_map = {}
+    for r in local_records:
+        k = make_record_key(r.get("sample_id"), r.get("fabrication_date"), r.get("created_at"))
+        s_clean = str(r.get("sample_id") or "").strip().lower()
+        if k in merged_tombstones or s_clean in merged_tombstones:
+            try:
+                with sqlite3.connect(db_path) as conn:
+                    conn.cursor().execute("DELETE FROM fabrication_records WHERE id = ?", (r["id"],))
+                    conn.commit()
+            except Exception:
+                pass
+        else:
+            local_map[k] = r
+
     # 3. 双方向スマートマージの実行
     pulled_count = 0
     pushed_count = 0
     updated_local_count = 0
 
-    # ローカル辞書マップの構築: key -> record
-    local_map = {}
-    for r in local_records:
-        k = make_record_key(r.get("sample_id"), r.get("fabrication_date"), r.get("created_at"))
-        local_map[k] = r
-
-    # (A) クラウドレコードをローカルに取り込み
+    # (A) クラウドレコードをローカルに取り込み（削除墓石は厳格に除外）
     for cr in cloud_records:
         c_sid = cr.get("sample_id", "")
+        c_clean = str(c_sid).strip().lower()
         c_fdate = cr.get("fabrication_date") or cr.get("created_at", "")[:10]
         c_cat = cr.get("created_at", "")
         c_key = make_record_key(c_sid, c_fdate, c_cat)
+
+        if c_key in merged_tombstones or c_clean in merged_tombstones:
+            continue
 
         # メディア写真ファイルのローカル解決
         sem_f = cr.get("sem_photo_file") or cr.get("sem_photo_path")
@@ -251,6 +377,11 @@ def sync_with_cloud(
     export_list = []
 
     for lr in merged_local_records:
+        k = make_record_key(lr.get("sample_id"), lr.get("fabrication_date"), lr.get("created_at"))
+        s_clean = str(lr.get("sample_id") or "").strip().lower()
+        if k in merged_tombstones or s_clean in merged_tombstones:
+            continue
+
         sem_p = lr.get("sem_photo_path")
         sem_filename = None
         if sem_p:
@@ -285,6 +416,7 @@ def sync_with_cloud(
         "last_synced_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "synced_by_host": os.environ.get("COMPUTERNAME", "PC"),
         "total_records": len(export_list),
+        "deleted_keys": sorted(list(merged_tombstones)),
         "records": export_list
     }
 

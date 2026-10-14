@@ -200,6 +200,7 @@ def save_record(
     if db_path == DB_PATH:
         try:
             import sync_manager
+            sync_manager.unregister_tombstone(sample_id, safe_date, created_at)
             sync_manager.sync_with_cloud(db_path=db_path)
         except Exception:
             pass
@@ -299,18 +300,24 @@ def get_record_by_id(record_id: int, db_path: str = DB_PATH) -> Optional[Dict[st
     }
 
 def delete_record(record_id: int, db_path: str = DB_PATH) -> bool:
-    """レコードを削除"""
+    """レコードを削除（クラウド同期マスターからも確実に消去）"""
     init_db(db_path)
+    rec_info = get_record_by_id(record_id, db_path=db_path)
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM fabrication_records WHERE id = ?", (record_id,))
         deleted = cursor.rowcount > 0
         conn.commit()
 
-    if deleted and db_path == DB_PATH:
+    if deleted and db_path == DB_PATH and rec_info:
         try:
             import sync_manager
-            sync_manager.sync_with_cloud(db_path=db_path)
+            sync_manager.register_record_deletion(
+                sample_id=rec_info.get("sample_id"),
+                fab_date=rec_info.get("fabrication_date"),
+                created_at=rec_info.get("created_at"),
+                db_path=db_path
+            )
         except Exception:
             pass
     return deleted
