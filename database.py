@@ -68,16 +68,52 @@ def init_db(db_path: str = DB_PATH):
             cursor.execute("ALTER TABLE fabrication_records ADD COLUMN temperature TEXT")
         except Exception:
             pass
+        try:
+            cursor.execute("ALTER TABLE fabrication_records ADD COLUMN updated_at TEXT")
+        except Exception:
+            pass
         conn.commit()
 
-def get_db_bytes() -> bytes:
-    """データベースファイル（nanofiber_data.db）をバイト列として取得"""
-    init_db()
-    with open(DB_PATH, "rb") as f:
-        return f.read()
+def sync_with_cloud(custom_sync_dir: Optional[str] = None, db_path: str = DB_PATH) -> Dict[str, Any]:
+    """クラウド / Google Drive 共有マスターとの双方向同期を実行"""
+    try:
+        import sync_manager
+        return sync_manager.sync_with_cloud(db_path=db_path, custom_sync_dir=custom_sync_dir)
+    except Exception as e:
+        return {"success": False, "error": str(e), "total_records": len(get_all_records(db_path=db_path))}
 
-def restore_db_from_bytes(data: bytes) -> bool:
-    """アップロードされたデータからデータベースを安全に復元・検証"""
+def export_all_records_json(db_path: str = DB_PATH) -> str:
+    """全レコードをJSONエクスポート"""
+    import sync_manager
+    return sync_manager.export_all_records_json(db_path=db_path)
+
+def import_records_from_json(json_content_or_dict: Any, db_path: str = DB_PATH) -> Dict[str, Any]:
+    """JSONからレコードを安全に取り込み・マージ"""
+    import sync_manager
+    return sync_manager.import_records_from_json(json_content_or_dict, db_path=db_path)
+
+def resolve_media_file(filename_or_path: Optional[str]) -> Optional[str]:
+    """メディア（SEM写真等）のローカル実パスを解決"""
+    import sync_manager
+    return sync_manager.resolve_media_file(filename_or_path)
+
+def get_shared_sync_dir() -> str:
+    """現在の同期ディレクトリを取得"""
+    import sync_manager
+    return sync_manager.get_shared_sync_dir()
+
+def merge_databases(source_db_path: str, target_db_path: str = DB_PATH) -> Dict[str, Any]:
+    """別のSQLiteデータベースファイルから全レコードを取り込み・マージ（古いスキーマの自動マイグレーションにも対応）"""
+    if not os.path.exists(source_db_path):
+        return {"success": False, "error": "指定されたファイルが存在しません"}
+    try:
+        init_db(source_db_path)
+        source_records = get_all_records(include_csv_data=True, db_path=source_db_path)
+        import sync_manager
+        return sync_manager.import_records_from_json(source_records, db_path=target_db_path)
+    except Exception as e:
+        return {"success": False, "error": f"データベースマージ失敗: {str(e)}"}
+
     temp_path = DB_PATH + ".temp"
     try:
         with open(temp_path, "wb") as f:
@@ -142,19 +178,29 @@ def save_record(
             INSERT INTO fabrication_records (
                 sample_id, created_at, photo_path, params_json, csv_path, csv_data_json,
                 initial_val, final_pct, min_pct, notes, sem_photo_path, total_distance_mm, is_broken,
-                recipe_name, fabrication_date, temperature
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                recipe_name, fabrication_date, temperature, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             sample_id, created_at, photo_path, params_json, csv_path, csv_data_json,
             safe_init_val, safe_final_pct, safe_min_pct, notes, sem_photo_path, safe_dist, safe_broken,
-            safe_recipe, safe_date, safe_temp
+            safe_recipe, safe_date, safe_temp, created_at
         ))
         record_id = cursor.lastrowid
         conn.commit()
+
+    # クラウド / Google Drive への自動同期（バックグラウンド反映）
+    if db_path == DB_PATH:
+        try:
+            import sync_manager
+            sync_manager.sync_with_cloud(db_path=db_path)
+        except Exception:
+            pass
+
     return record_id
 
 def get_all_records(include_csv_data: bool = False, db_path: str = DB_PATH) -> List[Dict[str, Any]]:
     """すべての作製レコードを取得（最新順、include_csv_data=Falseで高速化）"""
+    init_db(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -252,6 +298,13 @@ def delete_record(record_id: int, db_path: str = DB_PATH) -> bool:
         cursor.execute("DELETE FROM fabrication_records WHERE id = ?", (record_id,))
         deleted = cursor.rowcount > 0
         conn.commit()
+
+    if deleted and db_path == DB_PATH:
+        try:
+            import sync_manager
+            sync_manager.sync_with_cloud(db_path=db_path)
+        except Exception:
+            pass
     return deleted
 
 def update_sem_photo(record_id: int, sem_photo_path: str, db_path: str = DB_PATH) -> bool:
@@ -292,7 +345,7 @@ def update_record(
     temperature: Optional[str] = "",
     db_path: str = DB_PATH
 ) -> bool:
-    """既存レコードの全データを更新"""
+    """既存レコードの全データを安全に更新（未変更のCSVや写真データを確実に保持）"""
     init_db(db_path)
     cleaned_params = clean_for_json(params)
     cleaned_csv_data = clean_for_json(csv_data) if csv_data else None
@@ -308,9 +361,29 @@ def update_record(
     safe_recipe = str(recipe_name or "").strip()
     safe_date = str(fabrication_date or "").strip()
     safe_temp = str(temperature or "").strip()
+    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
+
+        # CSVや写真が渡されていない場合、既存の保持データを誤って消去しないよう取得・保護
+        if csv_data is None or sem_photo_path is None:
+            cursor.execute("SELECT csv_path, csv_data_json, initial_val, final_pct, min_pct, sem_photo_path FROM fabrication_records WHERE id = ?", (record_id,))
+            cur_row = cursor.fetchone()
+            if cur_row:
+                if csv_data is None and cur_row[1]:
+                    csv_data_json = cur_row[1]
+                    if csv_path is None or not csv_path:
+                        csv_path = cur_row[0]
+                    if safe_init_val is None:
+                        safe_init_val = cur_row[2]
+                    if safe_final_pct is None:
+                        safe_final_pct = cur_row[3]
+                    if safe_min_pct is None:
+                        safe_min_pct = cur_row[4]
+                if sem_photo_path is None and cur_row[5]:
+                    sem_photo_path = cur_row[5]
+
         cursor.execute("""
             UPDATE fabrication_records SET
                 sample_id = ?,
@@ -326,16 +399,26 @@ def update_record(
                 min_pct = ?,
                 recipe_name = ?,
                 fabrication_date = ?,
-                temperature = ?
+                temperature = ?,
+                updated_at = ?
             WHERE id = ?
         """, (
             sample_id, params_json, notes, safe_broken, safe_dist,
             sem_photo_path, csv_path, csv_data_json,
             safe_init_val, safe_final_pct, safe_min_pct, safe_recipe,
-            safe_date, safe_temp, record_id
+            safe_date, safe_temp, now_ts, record_id
         ))
         updated = cursor.rowcount > 0
         conn.commit()
+
+    # クラウド / Google Drive への自動同期（バックグラウンド反映）
+    if updated and db_path == DB_PATH:
+        try:
+            import sync_manager
+            sync_manager.sync_with_cloud(db_path=db_path)
+        except Exception:
+            pass
+
     return updated
 
 def safe_num(v, default=0.0):

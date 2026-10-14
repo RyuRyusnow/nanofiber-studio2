@@ -67,6 +67,45 @@ def run_tests():
         all_recs = db.get_all_records(db_path=test_db)
         print(f"Total records in test DB: {len(all_recs)}")
         assert len(all_recs) == 1
+
+        # Test safe update without losing csv_data
+        db.update_record(
+            record_id=rec_id,
+            sample_id="NF-20261007-SAMPLE-EDITED",
+            params=sample_params,
+            notes="Updated note only",
+            csv_data=None, # should preserve existing csv_data
+            db_path=test_db
+        )
+        updated_rec = db.get_record_by_id(rec_id, db_path=test_db)
+        assert updated_rec["csv_data"] is not None, "csv_data must NOT be wiped when updating other fields!"
+        assert updated_rec["sample_id"] == "NF-20261007-SAMPLE-EDITED"
+        print("Safe update test passed! (csv_data preserved)")
+
+        # Test JSON export and import
+        exported_json = db.export_all_records_json(db_path=test_db)
+        assert "NF-20261007-SAMPLE-EDITED" in exported_json
+        print("JSON export test passed!")
+
+        # Test import into a fresh DB
+        fresh_test_db = os.path.join(os.path.dirname(__file__), "_test_import_temp.db")
+        if os.path.exists(fresh_test_db):
+            os.remove(fresh_test_db)
+        try:
+            import_res = db.import_records_from_json(exported_json, db_path=fresh_test_db)
+            assert import_res["success"] is True
+            assert import_res["imported_count"] == 1
+            fresh_recs = db.get_all_records(include_csv_data=True, db_path=fresh_test_db)
+            assert len(fresh_recs) == 1
+            assert fresh_recs[0]["has_csv"] is True
+            print("Smart merge & import test passed!")
+        finally:
+            if os.path.exists(fresh_test_db):
+                try:
+                    os.remove(fresh_test_db)
+                except Exception:
+                    pass
+
     finally:
         if os.path.exists(test_db):
             try:

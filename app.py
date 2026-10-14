@@ -857,8 +857,15 @@ if "sem_image_name" not in st.session_state:
     st.session_state["sem_image_name"] = None
 if "selected_record_id" not in st.session_state:
     st.session_state["selected_record_id"] = "NEW"
-if "compare_selection" not in st.session_state:
-    st.session_state["compare_selection"] = []
+# 初回ロード時またはセッション開始時の自動クラウド同期（他PCで保存された条件・連携データを自動反映）
+if "cloud_sync_initialized" not in st.session_state:
+    st.session_state["cloud_sync_initialized"] = True
+    try:
+        sync_res = db.sync_with_cloud()
+        if sync_res.get("pulled_count", 0) > 0:
+            st.toast(f"[自動同期] クラウドから {sync_res['pulled_count']} 件の新規データを取り込みました")
+    except Exception:
+        pass
 
 # 全レコード取得（CSVデータは除外して高速化）
 all_records = db.get_all_records(include_csv_data=False)
@@ -1121,7 +1128,39 @@ with st.sidebar:
                     st.toast("APIキーを保存しました")
 
         st.markdown("---")
-        st.caption("データのバックアップ ＆ クラウド同期")
+        st.caption("他PC連携 ＆ クラウドデータ同期 (Google Drive)")
+        sync_dir_curr = db.get_shared_sync_dir()
+        is_gdrive = "マイドライブ" in sync_dir_curr or "Google" in sync_dir_curr
+
+        st.markdown(f"""
+        <div style="background:#0f172a; border:1px solid #1e293b; border-radius:6px; padding:6px 10px; margin-bottom:8px;">
+            <div style="font-size:0.72rem; color:#94a3b8;">同期先フォルダ:</div>
+            <div style="font-size:0.78rem; font-weight:600; color:{'#34d399' if is_gdrive else '#38bdf8'}; word-break:break-all;">{sync_dir_curr}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if st.button("クラウドと今すぐ同期", type="primary", use_container_width=True, key="btn_sync_now_sidebar"):
+            with st.spinner("クラウド (Google Drive) と同期中..."):
+                sync_res = db.sync_with_cloud()
+                if sync_res.get("success"):
+                    p_cnt = sync_res.get("pulled_count", 0)
+                    u_cnt = sync_res.get("updated_count", 0)
+                    tot = sync_res.get("total_records", 0)
+                    st.toast(f"[同期完了] クラウドから{p_cnt}件取得、全{tot}件のデータを最新化しました")
+                    st.rerun()
+                else:
+                    st.error(f"同期エラー: {sync_res.get('error')}")
+
+        all_json_str = db.export_all_records_json()
+        st.download_button(
+            "全データのエクスポート (.json)",
+            data=all_json_str.encode("utf-8"),
+            file_name=f"nanofiber_all_data_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+            help="条件・透過率データ・歩留まり実績を含む全サンプルの同期ファイルを保存します"
+        )
+
         db_raw_bytes = db.get_db_bytes()
         st.download_button(
             "データベース保存 (.db)",
@@ -1130,19 +1169,33 @@ with st.sidebar:
             mime="application/x-sqlite3",
             use_container_width=True
         )
-        restore_file = st.file_uploader(
-            "バックアップから復元",
-            type=["db"],
-            key="db_restore_uploader",
-            help="過去にダウンロードした .db ファイルを選択するとデータを一括復元できます"
-        )
-        if restore_file is not None:
-            if st.button("このデータで復元する", type="secondary", use_container_width=True):
-                if db.restore_db_from_bytes(restore_file.getvalue()):
-                    st.success("データベースを復元しました")
-                    st.rerun()
-                else:
-                    st.error("データベースの復元に失敗しました。ファイル形式を確認してください。")
+
+        with st.expander("他PCからのデータ統合 (インポート)", expanded=False):
+            import_file = st.file_uploader(
+                "他PCの同期ファイルを選択",
+                type=["json", "db"],
+                key="db_sync_import_uploader",
+                help="他PCからエクスポートした .json または .db を選択すると、既存データを壊さず安全にマージ統合します"
+            )
+            if import_file is not None:
+                if st.button("このデータを取り込み・統合する", use_container_width=True, key="btn_run_import_merge"):
+                    fname = import_file.name.lower()
+                    if fname.endswith(".json"):
+                        res = db.import_records_from_json(import_file.getvalue().decode("utf-8", errors="replace"))
+                    else:
+                        tmp_p = os.path.join(DB_DIR, "_temp_import.db")
+                        with open(tmp_p, "wb") as f:
+                            f.write(import_file.getvalue())
+                        res = db.merge_databases(tmp_p)
+                        try:
+                            os.remove(tmp_p)
+                        except Exception:
+                            pass
+                    if res.get("success"):
+                        st.toast(f"[統合完了] {res.get('imported_count', 0)} 件の作製データを取り込みました")
+                        st.rerun()
+                    else:
+                        st.error(f"取り込み失敗: {res.get('error')}")
 
         st.markdown("---")
         st.caption("デスクトップの「ナノ光ファイバ管理」ショートカットから起動可能。")
@@ -1339,7 +1392,7 @@ elif st.session_state["selected_record_id"] == "NEW":
     # トップコントロールカード
     refresh_tag = st.session_state.get("editor_refresh_id", 0)
     with st.container(border=True):
-        row1_c1, row1_c2, row1_c3 = st.columns([1.6, 1.2, 1.2], gap="medium")
+        row1_c1, row1_c2 = st.columns([2.0, 1.0], gap="medium")
         with row1_c1:
             st.session_state["sample_id"] = st.text_input(
                 "サンプル識別名 (Sample ID)",
@@ -1354,26 +1407,12 @@ elif st.session_state["selected_record_id"] == "NEW":
                 key=f"fab_date_new_{refresh_tag}"
             )
             st.session_state["fabrication_date"] = picked_date
-        with row1_c3:
-            cur_p_list = st.session_state.get("extracted_params") or []
-            max_c_val = max([safe_num(p.get("current_A")) for p in cur_p_list if isinstance(p, dict)] or [0.0])
-            conv_t_val = temp_conv.convert_current_to_temperature(max_c_val, round_digits=0) if max_c_val > 0 else None
-            conv_t_str = f"{conv_t_val:.0f}" if conv_t_val else ""
 
-            # 初期値：セッションに値が空で換算値があれば自動反映
-            raw_temp_val = st.session_state.get("temperature", "")
-            if not raw_temp_val and conv_t_str:
-                raw_temp_val = conv_t_str
-                st.session_state["temperature"] = raw_temp_val
-
-            temp_help = f"ヒーター電流 {max_c_val:.3f}A より自動換算: {conv_t_str}°C" if conv_t_str else "加熱炉温度（°C）を入力します"
-            st.session_state["temperature"] = st.text_input(
-                "加熱温度 (°C)",
-                value=st.session_state.get("temperature", ""),
-                placeholder=f"自動換算: {conv_t_str}°C" if conv_t_str else "例: 1400",
-                key=f"temp_new_{refresh_tag}",
-                help=temp_help
-            )
+        # 加熱温度はヒーター電流から自動換算（手動入力欄はご要望に基づき削除）
+        cur_p_list = st.session_state.get("extracted_params") or []
+        max_c_val = max([safe_num(p.get("current_A")) for p in cur_p_list if isinstance(p, dict)] or [0.0])
+        conv_t_val = temp_conv.convert_current_to_temperature(max_c_val, round_digits=0) if max_c_val > 0 else None
+        st.session_state["temperature"] = f"{conv_t_val:.0f}℃" if conv_t_val else ""
 
         row2_c1, row2_c2, row2_c3, row2_c4 = st.columns([1.5, 1.3, 2.0, 1.4], gap="medium")
         with row2_c1:
@@ -1455,40 +1494,6 @@ elif st.session_state["selected_record_id"] == "NEW":
     with c_left:
         st.markdown('<div class="section-header"><span>1. 作製条件パラメータ</span></div>', unsafe_allow_html=True)
 
-        # ヒーター電流 ⇄ 温度 リアルタイム換算ツール
-        with st.expander("ヒーター電流 ⇄ 加熱温度 リアルタイム換算ツール ＆ 校正特性", expanded=False):
-            tc_c1, tc_c2, tc_c3 = st.columns([1.5, 2.0, 1.4], gap="medium")
-            with tc_c1:
-                cur_step_c = float(s_sum.get("max_current_A") or 6.000)
-                calc_in_c = st.number_input(
-                    "ヒーター電流 I (A)",
-                    min_value=0.0,
-                    max_value=10.0,
-                    value=cur_step_c,
-                    step=0.05,
-                    format="%.3f",
-                    key=f"live_conv_curr_a_{refresh_tag}"
-                )
-            with tc_c2:
-                calc_out_t = temp_conv.convert_current_to_temperature(calc_in_c, round_digits=1)
-                st.markdown(f"""
-                <div style="background:#1e293b; border:1px solid #38bdf8; border-radius:8px; padding:6px 12px; margin-top:8px;">
-                    <div style="color:#94a3b8; font-size:0.75rem;">自動換算温度:</div>
-                    <div style="color:#38bdf8; font-size:1.25rem; font-weight:700;">{calc_out_t:.1f} °C <span style="font-size:0.8rem; color:#94a3b8; font-weight:400;">(約 {calc_out_t:.0f} °C)</span></div>
-                </div>
-                """, unsafe_allow_html=True)
-            with tc_c3:
-                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                if st.button("この温度を入力欄に適用", key=f"btn_apply_t_left_a_{refresh_tag}", use_container_width=True):
-                    st.session_state["temperature"] = f"{calc_out_t:.0f}"
-                    st.toast(f"加熱温度を {calc_out_t:.0f} °C に設定しました")
-                    st.session_state["editor_refresh_id"] = st.session_state.get("editor_refresh_id", 0) + 1
-                    st.rerun()
-
-            with st.expander("電流-温度 換算曲線 ＆ 校正基準点（グラフ）", expanded=False):
-                st.plotly_chart(temp_conv.create_calibration_chart(highlight_current=calc_in_c), use_container_width=True, config={"displayModeBar": False})
-                st.dataframe(temp_conv.get_calibration_dataframe(), use_container_width=True, hide_index=True)
-
         with st.expander("モニタ写真から作製条件を自動抽出 (AI OCR)", expanded=False):
             r_c1, r_c2 = st.columns([2, 1])
             with r_c1:
@@ -1554,8 +1559,8 @@ elif st.session_state["selected_record_id"] == "NEW":
             </div>
             <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
             <div>
-                <div class="instrument-title">換算加熱温度 T_conv</div>
-                <div class="instrument-val" style="color:#fbbf24;">{s_sum['max_temp_str']}</div>
+                <div class="instrument-title">最高加熱電流 I_max</div>
+                <div class="instrument-val" style="color:#38bdf8;">{s_sum['max_current_A']:.3f} A</div>
             </div>
             <div style="border-left: 1px solid #2b3e5e; height: 32px;"></div>
             <div>
@@ -1747,6 +1752,11 @@ elif st.session_state["selected_record_id"] == "NEW":
             try:
                 with open(saved_sem_p, "wb") as f:
                     f.write(st.session_state["sem_image_bytes"])
+                try:
+                    import sync_manager
+                    sync_manager.copy_media_to_sync(saved_sem_p)
+                except Exception:
+                    pass
             except Exception:
                 saved_sem_p = None
 
@@ -2129,12 +2139,13 @@ else:
             # 2. SEM写真
             st.markdown('<div class="section-header"><span>2. SEM写真（電子顕微鏡観察）</span></div>', unsafe_allow_html=True)
             cur_sem_path = rec.get("sem_photo_path")
+            resolved_sem = db.resolve_media_file(cur_sem_path)
             delete_sem_flag = False
 
-            if cur_sem_path and os.path.exists(cur_sem_path):
+            if resolved_sem and os.path.exists(resolved_sem):
                 try:
-                    sem_image_obj = Image.open(cur_sem_path)
-                    st.image(sem_image_obj, caption=f"登録SEM写真: {os.path.basename(cur_sem_path)}", width="stretch")
+                    sem_image_obj = Image.open(resolved_sem)
+                    st.image(sem_image_obj, caption=f"登録SEM写真: {os.path.basename(resolved_sem)}", width="stretch")
                     delete_sem_flag = st.checkbox("このSEM写真を削除する（保存時に反映）", key=f"chk_del_sem_{rec_id}")
                 except Exception:
                     st.warning("SEM写真の表示に失敗しました。")
@@ -2243,7 +2254,7 @@ else:
 
         # 保存実行処理
         if save_detail_top or save_detail_bottom:
-            final_sem_path = cur_sem_path
+            final_sem_path = resolved_sem or cur_sem_path
             if delete_sem_flag:
                 final_sem_path = None
             elif new_sem_file is not None:
@@ -2253,6 +2264,11 @@ else:
                 final_sem_path = os.path.join(SEM_DIR, sem_fname)
                 with open(final_sem_path, "wb") as f:
                     f.write(sem_bytes)
+                try:
+                    import sync_manager
+                    sync_manager.copy_media_to_sync(final_sem_path)
+                except Exception:
+                    pass
 
             db.update_record(
                 record_id=rec_id,
